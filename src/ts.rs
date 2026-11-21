@@ -243,15 +243,16 @@ fn civil_simd(b: &[u8]) -> Option<i64> {
     Some((days * 86_400 + secs) * SECOND - offset_minutes * 60 * SECOND)
 }
 
-/// `ingest_ts`, which rules.md guarantees is always valid F1: a 20-byte value is converted
-/// without the separator, digit and range checks of `civil_simd`; any other length (never
-/// produced) goes through `parse_wide`, so it is still rejected or read correctly.
+/// `ingest_ts`, which rules.md guarantees is always valid F1, as (whole seconds, rounded down;
+/// milliseconds): a 20-byte value is converted without the separator, digit and range checks of
+/// `civil_simd`, and its seconds need no division; any other length (never produced) goes
+/// through `parse_wide`, so it is still rejected or read correctly.
 #[cfg(all(target_feature = "avx2", target_feature = "bmi2"))]
 #[inline(always)]
-pub fn parse_trusted_f1(w: &[u8; 16], b: &[u8]) -> Option<i64> {
+pub fn parse_trusted_f1(w: &[u8; 16], b: &[u8]) -> Option<(i64, i64)> {
     use std::arch::x86_64::*;
     if b.len() != 20 {
-        return parse_wide(w, b);
+        return parse_wide(w, b).map(|ms| (ms.div_euclid(SECOND), ms));
     }
     let y = u32::from_le_bytes(b[..4].try_into().unwrap()).wrapping_sub(0x3030_3030);
     let year = (y & 0xFF) * 1000 + (y >> 8 & 0xFF) * 100 + (y >> 16 & 0xFF) * 10 + (y >> 24);
@@ -271,15 +272,16 @@ pub fn parse_trusted_f1(w: &[u8; 16], b: &[u8]) -> Option<i64> {
     let at = (year.wrapping_sub(TABLE_FIRST_YEAR) as usize) * 12 + (month as usize).wrapping_sub(1);
     let days = match MONTHS.get(at) {
         Some(&(first, _)) => first as i64 + day as i64 - 1,
-        None => return parse_wide(w, b),
+        None => return parse_wide(w, b).map(|ms| (ms.div_euclid(SECOND), ms)),
     };
-    Some((days * 86_400 + secs) * SECOND)
+    let s = days * 86_400 + secs;
+    Some((s, s * SECOND))
 }
 
 #[cfg(not(all(target_feature = "avx2", target_feature = "bmi2")))]
 #[inline(always)]
-pub fn parse_trusted_f1(w: &[u8; 16], b: &[u8]) -> Option<i64> {
-    parse_wide(w, b)
+pub fn parse_trusted_f1(w: &[u8; 16], b: &[u8]) -> Option<(i64, i64)> {
+    parse_wide(w, b).map(|ms| (ms.div_euclid(SECOND), ms))
 }
 
 /// F1 / F2 on a fixed-size head (no bounds checks); `zone` is `Z` or `+HH:MM` / `-HH:MM`.
@@ -449,7 +451,7 @@ mod tests {
             let b = text.as_bytes();
             let mut w = [b'#'; 16];
             w.copy_from_slice(&b[..16]);
-            let want = parse(b);
+            let want = parse(b).map(|ms| (ms.div_euclid(SECOND), ms));
             assert!(want.is_some(), "{text}");
             assert_eq!(parse_trusted_f1(&w, b), want, "{text}");
             checked += 1;
@@ -459,7 +461,7 @@ mod tests {
             let mut w = [b'#'; 16];
             let n = other.len().min(16);
             w[..n].copy_from_slice(&other[..n]);
-            assert_eq!(parse_trusted_f1(&w, other), parse(other));
+            assert_eq!(parse_trusted_f1(&w, other), parse(other).map(|ms| (ms.div_euclid(SECOND), ms)));
         }
         assert_eq!(checked, 200_000);
     }

@@ -616,11 +616,12 @@ fn parse_event(ctx: &Ctx, r: &csv::Rec<'_, 7>) -> Option<EvRec> {
     if eid.is_empty() {
         return None;
     }
-    let ingest_ms = ts::parse_trusted_f1(r.wide(3), r.get(3));
-    let ingest = match ingest_ms {
-        Some(ms) => (ms.div_euclid(1000) - ctx.ingest_base_s).clamp(0, u32::MAX as i64 - 1) as u32,
+    let ingest_both = ts::parse_trusted_f1(r.wide(3), r.get(3));
+    let ingest = match ingest_both {
+        Some((s, _)) => (s - ctx.ingest_base_s).clamp(0, u32::MAX as i64 - 1) as u32,
         None => u32::MAX,
     };
+    let ingest_ms = ingest_both.map(|(_, ms)| ms);
     let mut rec = EvRec { eid: key::pack_wide(r.wide(0), eid), user: 0, ingest, ts: INVALID, pc: 0 };
     // event_type, exactly: one integer compare on the field's window instead of byte slices.
     let ty = u64::from_le_bytes(r.wide(4)[..8].try_into().unwrap());

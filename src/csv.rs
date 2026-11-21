@@ -165,6 +165,9 @@ impl Input {
 pub const SLACK: usize = 64;
 
 /// One well-formed line: field ranges into a buffer that has SLACK readable bytes past the data.
+///
+/// Invariant (established by `parse_records`, the only place a `Rec` is handed out): for every
+/// field `(s, e)`, `s <= e <= data.len() - SLACK`. The accessors rely on it to skip bounds checks.
 pub struct Rec<'a, const N: usize> {
     data: &'a [u8],
     at: [(usize, usize); N],
@@ -175,7 +178,9 @@ impl<'a, const N: usize> Rec<'a, N> {
     #[inline(always)]
     pub fn get(&self, i: usize) -> &'a [u8] {
         let (s, e) = self.at[i];
-        &self.data[s..e]
+        debug_assert!(s <= e && e + SLACK <= self.data.len());
+        // SAFETY: the struct invariant: s <= e <= data.len() - SLACK.
+        unsafe { self.data.get_unchecked(s..e) }
     }
 
     /// The length of field `i`, unquoted.
@@ -189,7 +194,9 @@ impl<'a, const N: usize> Rec<'a, N> {
     #[inline(always)]
     pub fn wide(&self, i: usize) -> &'a [u8; 16] {
         let s = self.at[i].0;
-        self.data[s..s + 16].try_into().unwrap()
+        debug_assert!(s + SLACK <= self.data.len());
+        // SAFETY: the struct invariant: s <= data.len() - SLACK, and SLACK >= 16.
+        unsafe { &*(self.data.as_ptr().add(s) as *const [u8; 16]) }
     }
 
     pub fn fields(&self) -> [&'a [u8]; N] {
@@ -260,6 +267,10 @@ pub fn parse_records<const N: usize>(data: &[u8], len: usize, start: usize, f: &
     assert!(data.len() >= len + SLACK);
     let mut ls = start;
     let mut pad = [0u8; 128];
+    // One record, filled in place line after line (no per-line zeroing or copy of the ranges).
+    let mut rec = Rec { data, at: [(0usize, 0usize); N] };
+    // Comma offsets from the line start: the low word's, then the high word's.
+    let mut pos = [0u32; 32];
     while ls < len {
         // The window must not show bytes past `len` (another chunk's lines, or stale buffer).
         let window: &[u8; 128] = if ls + 128 <= len {
@@ -274,30 +285,40 @@ pub fn parse_records<const N: usize>(data: &[u8], len: usize, start: usize, f: &
         // split evenly around 64 bytes, so they always take both words (no branch to mispredict).
         let (n1, c1, q1) = if N >= 5 || n0 == 0 { masks(window[64..].try_into().unwrap()) } else { (0, 0, 0) };
         // One place hands records on (`f` is called from a single site, so it can be inlined).
-        let mut at = [(0usize, 0usize); N];
+        let at = &mut rec.at;
         let ok;
         if n0 | n1 == 0 {
             let end = memchr(NL, &data[ls..len]).map_or(len, |p| ls + p);
-            ok = slow_line::<N>(data, ls, end, &mut at);
+            ok = slow_line::<N>(data, ls, end, at);
             ls = end + 1;
         } else {
             let t0 = n0.trailing_zeros() as usize;
             let nl = t0 + if t0 == 64 { n1.trailing_zeros() as usize } else { 0 };
             let nl_hi = nl.saturating_sub(64);
-            let mut lo = low_bits(c0, nl);
-            let mut hi = low_bits(c1, nl_hi);
+            let lo = low_bits(c0, nl);
+            let hi = low_bits(c1, nl_hi);
             let commas = (lo.count_ones() + hi.count_ones()) as usize;
             let (quoted, quotes_ok) = quoted_fields(lo, hi, low_bits(q0, nl), low_bits(q1, nl_hi), nl);
-            // The next comma: from the low word while it has one, then from the high word, without
-            // a branch (trailing_zeros of 0 is 64, and x & (x - 0) leaves x unchanged).
+            // Comma offsets, N-1 from each word, written unconditionally: the low word's first,
+            // then the high word's after the low word's count. Past a word's commas the entries are
+            // junk (trailing_zeros of 0 is 64), and only a line with exactly N-1 commas is used,
+            // so the first N-1 entries are then its commas in order. The & 31 keeps a line with
+            // more commas than that inside the array.
+            let mut m = lo;
+            for j in 0..N - 1 {
+                pos[j] = m.trailing_zeros();
+                m &= m.wrapping_sub(1);
+            }
+            let k0 = lo.count_ones() as usize;
+            let mut m = hi;
+            for j in 0..N - 1 {
+                pos[(k0 + j) & 31] = 64 + m.trailing_zeros();
+                m &= m.wrapping_sub(1);
+            }
             // A quoted field (bit i of `quoted`) loses its first and last byte.
             let mut s = ls;
             for (i, r) in at.iter_mut().enumerate().take(N - 1) {
-                let lo_empty = (lo == 0) as u64;
-                let pos = lo.trailing_zeros() as usize + (hi.trailing_zeros() as usize & 0usize.wrapping_sub(lo_empty as usize));
-                hi &= hi.wrapping_sub(lo_empty);
-                lo &= lo.wrapping_sub(1);
-                let e = ls + pos;
+                let e = ls + pos[i] as usize;
                 let q = (quoted >> i) as usize & 1;
                 *r = (s + q, e - q);
                 s = e + 1;
@@ -308,7 +329,10 @@ pub fn parse_records<const N: usize>(data: &[u8], len: usize, start: usize, f: &
             ls += nl + 1;
         }
         if ok {
-            f(&Rec { data, at });
+            // Rec's invariant: every field of a well-formed line lies within data[..len], in
+            // order (fast path: positions below the newline; slow path: slices of data[..len]).
+            debug_assert!(rec.at.iter().all(|&(s, e)| s <= e && e <= len));
+            f(&rec);
         }
     }
 }
