@@ -824,13 +824,20 @@ fn regroup<B: Bucket>(per_thread: Vec<Vec<B>>, n: usize) -> Vec<Mutex<Vec<B>>> {
     slots.into_iter().map(Mutex::new).collect()
 }
 
-/// Counting-sort scatter of several pieces into `nb` bins: returns the binned records and the
-/// start of each bin (nb + 1 offsets). Reads each piece in place, so no concatenation copy.
-fn bin_scatter<T: Copy>(pieces: &[&[T]], nb: usize, bin: impl Fn(&T) -> usize) -> (Vec<T>, Vec<usize>) {
+/// Counting-sort scatter of several pieces into `nb` bins, keeping the records `keep` accepts
+/// and storing `map` of each: returns the binned values and the start of each bin (nb + 1
+/// offsets). Reads each piece in place, so no concatenation copy.
+fn bin_scatter<T, U>(
+    pieces: &[&[T]],
+    nb: usize,
+    bin: impl Fn(&T) -> usize,
+    keep: impl Fn(&T) -> bool,
+    map: impl Fn(&T) -> U,
+) -> (Vec<U>, Vec<usize>) {
     let mut at = vec![0usize; nb + 1];
     for piece in pieces {
         for x in piece.iter() {
-            at[bin(x) + 1] += 1;
+            at[bin(x) + 1] += keep(x) as usize;
         }
     }
     for b in 0..nb {
@@ -838,17 +845,20 @@ fn bin_scatter<T: Copy>(pieces: &[&[T]], nb: usize, bin: impl Fn(&T) -> usize) -
     }
     // Every slot is written exactly once (the counts are the writes), so no zero-fill first.
     let n = at[nb];
-    let mut out: Vec<T> = Vec::with_capacity(n);
+    let mut out: Vec<U> = Vec::with_capacity(n);
     let spare = out.spare_capacity_mut();
     let mut next = at.clone();
     for piece in pieces {
         for x in piece.iter() {
-            let b = bin(x);
-            spare[next[b]].write(*x);
-            next[b] += 1;
+            if keep(x) {
+                let b = bin(x);
+                spare[next[b]].write(map(x));
+                next[b] += 1;
+            }
         }
     }
-    // SAFETY: the counting pass sized each bin exactly, so all n slots were written above.
+    // SAFETY: the counting pass sized each bin exactly with the same `keep` and `bin`, so all n
+    // slots were written above.
     unsafe { out.set_len(n) };
     (out, at)
 }
@@ -857,16 +867,13 @@ fn slot_len<B: Bucket>(slot: &Mutex<Vec<B>>) -> usize {
     slot.lock().unwrap().iter().map(|p| p.count()).sum()
 }
 
-/// Single-threaded micro-benchmarks of the event parse path (SS_BENCH=lines|split|event|push).
+/// Single-threaded micro-benchmarks of the event parse path (SS_BENCH=lines|split|event).
 fn bench(ctx: &Ctx, data: &Path, mode: &str) {
     let input = csv::Input::open(&csv::list_csv(&data.join("events")));
     let chunks = input.chunks(chunk_size());
     let t = Instant::now();
     let mut n = 0u64;
     let mut buf = Vec::new();
-    let np = 2048;
-    let mut buckets: scatter::Scatter<DedupRec, 4> = scatter::Scatter::new(np, input.bytes() / 56 / np + 64);
-    let mut payload: Vec<Pay> = Vec::with_capacity(input.bytes() / 56 + 64);
     for &c in &chunks {
         if mode == "lines" {
             input.lines(c, &mut buf, |line| n += line.len() as u64);
@@ -874,73 +881,119 @@ fn bench(ctx: &Ctx, data: &Path, mode: &str) {
         }
         input.records::<7>(c, &mut buf, |f| match mode {
             "split" => n += 1,
-            "event" => n += parse_event(ctx, f).is_some() as u64,
-            _ => {
-                if let Some(rec) = parse_event(ctx, f) {
-                    push_event(&rec, 0, &mut payload, &mut buckets, np);
-                    n += 1;
-                }
-            }
+            _ => n += parse_event(ctx, f).is_some() as u64,
         });
     }
     let secs = t.elapsed().as_secs_f64();
     eprintln!("bench {mode}: {n} in {secs:.3}s = {:.0} MB/s", input.bytes() as f64 / secs / 1e6);
 }
 
-/// What dedup needs of an event copy: its ID, its ingest time, and where its payload is
+/// What dedup needs of an event copy: its ID, its ingest time, and which valid copy it is
 /// (`NOREF` for a copy that fails validation: it competes in dedup but has nothing to keep).
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct DedupRec {
     eid: Key,
     ingest: u32,
-    pref: u32, // thread << REF_BITS | index into that thread's payload
+    pref: u32, // thread << REF_BITS | that thread's count of valid copies before this one
 }
 
-/// What a valid event copy contributes if it is its event's kept copy.
-#[derive(Clone, Copy)]
+/// A valid event copy, in its person's bucket. `tseq` is its DedupRec's `pref`, so the sessions
+/// phase can drop the copies that lost dedup.
+#[derive(Clone, Copy, Default)]
 #[repr(C)]
-struct Pay {
-    user: Key,
+struct PEv {
+    person: Key,
     ts: u32,
     pc: u32,
+    tseq: u32,
+    _pad: u32, // explicit: whole-record SIMD copies read no uninitialized bytes
 }
 
 const NOREF: u32 = u32::MAX;
 const REF_BITS: u32 = 26; // up to 64 threads and 67M valid events per thread
 const MAX_THREADS: usize = 1 << (32 - REF_BITS);
 
-/// Stores a parsed copy: the payload goes to this thread's sequential array, and a 16-byte
-/// record goes to the event-id bucket.
-#[inline(always)]
-fn push_event(rec: &EvRec, thread: usize, payload: &mut Vec<Pay>, buckets: &mut scatter::Scatter<DedupRec, 4>, np: usize) {
-    let pref = if rec.ts == INVALID {
-        NOREF
-    } else {
-        let at = payload.len();
-        assert!(at < (1 << REF_BITS) - 1, "too many events on one thread for a 26-bit reference");
-        payload.push(Pay { user: rec.user, ts: rec.ts, pc: rec.pc });
-        (thread as u32) << REF_BITS | at as u32
-    };
-    buckets.push(bucket(rec.eid, np), DedupRec { eid: rec.eid, ingest: rec.ingest, pref });
+/// A parsed valid event waiting for its person lookup.
+#[derive(Clone, Copy, Default)]
+struct EvPending {
+    user: Key,
+    ts: u32,
+    pc: u32,
+    tseq: u32,
+}
+
+trait HasUser {
+    fn user(&self) -> Key;
+}
+
+impl HasUser for EvPending {
+    #[inline(always)]
+    fn user(&self) -> Key {
+        self.user
+    }
+}
+
+impl HasUser for ClickRec {
+    #[inline(always)]
+    fn user(&self) -> Key {
+        self.person // a parsed click holds its user ID here until the lookup
+    }
+}
+
+const RING: usize = 8;
+
+/// A software pipeline for person lookups, run on the parsing threads. A record waits RING
+/// records between the start of its lookup (prefetch of the membership-filter word, then of the
+/// table slot) and its completion, so the lookup's memory latency overlaps the parsing of the
+/// records after it instead of stalling a separate phase.
+struct Ring<T: Copy + Default + HasUser> {
+    items: [T; RING],
+    n: usize,
+}
+
+impl<T: Copy + Default + HasUser> Ring<T> {
+    fn new() -> Self {
+        Ring { items: [T::default(); RING], n: 0 }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, persons: &Persons, x: T, mut done: impl FnMut(T, Key)) {
+        persons.prefetch_filter(x.user());
+        if self.n >= RING / 2 {
+            persons.prefetch_slot(self.items[(self.n - RING / 2) % RING].user());
+        }
+        if self.n >= RING {
+            let old = self.items[self.n % RING];
+            done(old, persons.get(old.user()));
+        }
+        self.items[self.n % RING] = x;
+        self.n += 1;
+    }
+
+    fn flush(&mut self, persons: &Persons, mut done: impl FnMut(T, Key)) {
+        for i in self.n.saturating_sub(RING)..self.n {
+            let old = self.items[i % RING];
+            done(old, persons.get(old.user()));
+        }
+        self.n = 0;
+    }
 }
 
 struct ParseState {
     thread: usize,
     buf: Vec<u8>,
     events: scatter::Scatter<DedupRec, 4>,
-    payload: Vec<Pay>,
-    clicks: Vec<ClickRec>,
+    sess: scatter::Scatter<PEv, 8>,
+    clicks: scatter::Scatter<ClickRec, 2>,
+    nseq: usize,
+    ev_ring: Ring<EvPending>,
+    ck_ring: Ring<ClickRec>,
 }
 
 struct DedupState {
     table: Vec<DedupRec>,
     used: Vec<u32>,
-}
-
-struct RegroupState {
-    sess: scatter::Scatter<u128, 4>,
-    clicks: scatter::Scatter<ClickRec, 2>,
 }
 
 fn main() {
@@ -954,15 +1007,26 @@ fn main() {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from))
         .clamp(1, MAX_THREADS);
 
-    let ctx = load_context(&data, start);
+    // ---- links on the whole pool (parsing needs them: events and clicks go straight to their
+    // person's bucket), while one more thread loads the lookups and plans the input chunks
+    let ((ctx, events_in, clicks_in, ev_chunks, ck_chunks), persons) = std::thread::scope(|scope| {
+        let setup = scope.spawn(|| {
+            let ctx = load_context(&data, start);
+            let events_in = csv::Input::open(&csv::list_csv(&data.join("events")));
+            let clicks_in = csv::Input::open(&csv::list_csv(&data.join("clicks")));
+            let ev_chunks = events_in.chunks(chunk_size());
+            let ck_chunks = clicks_in.chunks(chunk_size());
+            (ctx, events_in, clicks_in, ev_chunks, ck_chunks)
+        });
+        let persons = build_links(&data, threads);
+        log(start, &format!("links: {} non-name IDs mapped", persons.len()));
+        (setup.join().expect("setup thread panicked"), persons)
+    });
+    log(start, "setup joined");
     if let Ok(mode) = std::env::var("SS_BENCH") {
         bench(&ctx, &data, &mode);
         return;
     }
-    let events_in = csv::Input::open(&csv::list_csv(&data.join("events")));
-    let clicks_in = csv::Input::open(&csv::list_csv(&data.join("clicks")));
-    let ev_chunks = events_in.chunks(chunk_size());
-    let ck_chunks = clicks_in.chunks(chunk_size());
 
     // Event-id buckets small enough that a bucket's dedup table stays in L2.
     let np: usize = std::env::var("SS_NP")
@@ -970,68 +1034,93 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or((events_in.bytes() / 76 / 8192).next_power_of_two())
         .clamp(64, 4096);
+    // Person buckets small enough that a bucket's events, clicks and their sorted copies stay
+    // in L2 during the sessions phase.
+    let nq: usize = std::env::var("SS_NQ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or((events_in.bytes() / 76 / 16384).next_power_of_two())
+        .clamp(64, 4096);
     // Capacities with headroom: a doubling copy of a big array costs far more than slack.
     let ev_estimate = events_in.bytes() / 56 / np / threads + 64;
-    let pay_estimate = events_in.bytes() / 56 / threads + 64;
-    let ck_estimate = clicks_in.bytes() / 30 / threads + 64;
+    let sess_estimate = events_in.bytes() / 56 / nq / threads + 64;
+    let ck_estimate = clicks_in.bytes() / 30 / nq / threads + 64;
     let n_tasks = ev_chunks.len() + ck_chunks.len();
 
-    // ---- parse events and clicks on the pool; links (which parsing does not need) alongside
+    // ---- parse: each event copy goes to its event-id bucket (for dedup) and, if valid, to its
+    // person's bucket; each click to its person's bucket. Person lookups run in a prefetch ring.
     let thread_ids = AtomicUsize::new(0);
-    let (parsed, persons) = std::thread::scope(|scope| {
-        let links = scope.spawn(|| {
-            let persons = build_links(&data, threads.min(2));
-            log(start, &format!("links: {} non-name IDs mapped", persons.len()));
-            persons
-        });
-        let parsed = parallel(
-            "parse",
-            threads,
-            n_tasks,
-            || ParseState {
-                thread: thread_ids.fetch_add(1, Ordering::Relaxed),
-                buf: Vec::new(),
-                events: scatter::Scatter::new(np, ev_estimate),
-                payload: Vec::with_capacity(pay_estimate),
-                clicks: Vec::with_capacity(ck_estimate),
-            },
-            |st, task| {
-                let ParseState { thread, buf, events, payload, clicks } = st;
-                if task < ev_chunks.len() {
-                    events_in.records::<7>(ev_chunks[task], buf, |f| {
-                        if let Some(rec) = parse_event(&ctx, f) {
-                            push_event(&rec, *thread, payload, events, np);
-                        }
-                    });
-                } else {
-                    clicks_in.records::<4>(ck_chunks[task - ev_chunks.len()], buf, |f| {
-                        if let Some(rec) = parse_click(&ctx, f) {
-                            clicks.push(rec);
-                        }
-                    });
-                }
-            },
-        );
-        log(start, &format!("parsed {} MB events, {} MB clicks", events_in.bytes() >> 20, clicks_in.bytes() >> 20));
-        (parsed, links.join().expect("links thread panicked"))
-    });
-    log(start, "links joined");
+    let parsed = parallel(
+        "parse",
+        threads,
+        n_tasks,
+        || ParseState {
+            thread: thread_ids.fetch_add(1, Ordering::Relaxed),
+            buf: Vec::new(),
+            events: scatter::Scatter::new(np, ev_estimate),
+            sess: scatter::Scatter::new(nq, sess_estimate),
+            clicks: scatter::Scatter::new(nq, ck_estimate),
+            nseq: 0,
+            ev_ring: Ring::new(),
+            ck_ring: Ring::new(),
+        },
+        |st, task| {
+            let ParseState { thread, buf, events, sess, clicks, nseq, ev_ring, ck_ring } = st;
+            let thread = *thread as u32;
+            let mut to_bucket = |x: EvPending, person: Key| {
+                sess.push(bucket(person, nq), PEv { person, ts: x.ts, pc: x.pc, tseq: x.tseq, _pad: 0 });
+            };
+            if task < ev_chunks.len() {
+                events_in.records::<7>(ev_chunks[task], buf, |f| {
+                    if let Some(rec) = parse_event(&ctx, f) {
+                        let pref = if rec.ts == INVALID {
+                            NOREF
+                        } else {
+                            assert!(*nseq < (1 << REF_BITS) - 1, "too many events on one thread for a 26-bit reference");
+                            let pref = thread << REF_BITS | *nseq as u32;
+                            *nseq += 1;
+                            let pending = EvPending { user: rec.user, ts: rec.ts, pc: rec.pc, tseq: pref };
+                            ev_ring.push(&persons, pending, &mut to_bucket);
+                            pref
+                        };
+                        events.push(bucket(rec.eid, np), DedupRec { eid: rec.eid, ingest: rec.ingest, pref });
+                    }
+                });
+                ev_ring.flush(&persons, &mut to_bucket);
+            } else {
+                let mut click_to_bucket = |mut c: ClickRec, person: Key| {
+                    c.person = person;
+                    clicks.push(bucket(person, nq), c);
+                };
+                clicks_in.records::<4>(ck_chunks[task - ev_chunks.len()], buf, |f| {
+                    if let Some(rec) = parse_click(&ctx, f) {
+                        ck_ring.push(&persons, rec, &mut click_to_bucket);
+                    }
+                });
+                ck_ring.flush(&persons, &mut click_to_bucket);
+            }
+        },
+    );
+    log(start, &format!("parsed {} MB events, {} MB clicks", events_in.bytes() >> 20, clicks_in.bytes() >> 20));
     let mut ev_threads = Vec::with_capacity(parsed.len());
-    let mut payloads: Vec<Vec<Pay>> = (0..threads).map(|_| Vec::new()).collect();
-    let mut ck_lists = Vec::with_capacity(parsed.len());
+    let mut sess_threads = Vec::with_capacity(parsed.len());
+    let mut ck_threads = Vec::with_capacity(parsed.len());
+    let mut valid = vec![0usize; threads];
     for st in parsed {
+        valid[st.thread] = st.nseq;
         ev_threads.push(st.events.finish());
-        payloads[st.thread] = st.payload;
-        ck_lists.push(st.clicks);
+        sess_threads.push(st.sess.finish());
+        ck_threads.push(st.clicks.finish());
     }
     let ev_slots = regroup(ev_threads, np);
-    // One bit per payload entry, set when that copy lost its event's dedup.
-    let losers: Vec<Vec<AtomicU64>> =
-        payloads.iter().map(|p| (0..p.len() / 64 + 1).map(|_| AtomicU64::new(0)).collect()).collect();
+    let sess_slots = regroup(sess_threads, nq);
+    let ck_slots = regroup(ck_threads, nq);
+    // One bit per valid copy, set when that copy lost its event's dedup.
+    let losers: Vec<Vec<AtomicU64>> = valid.iter().map(|&n| (0..n / 64 + 1).map(|_| AtomicU64::new(0)).collect()).collect();
 
     // ---- dedup on event_id: per bucket, the copy with the smallest ingest_ts is kept and every
-    // other copy that has a payload is marked a loser. Duplicates are a few percent of rows, so
-    // this phase only reads 16-byte records and probes a small table.
+    // other valid copy is marked a loser. Duplicates are a few percent of rows, so this phase
+    // only reads 16-byte records and probes a small table.
     let deduped = parallel(
         "dedup",
         threads,
@@ -1079,93 +1168,17 @@ fn main() {
                 st.table[slot as usize].eid = key::EMPTY;
             }
             st.used.clear();
-            // The process ends soon: freeing a bucket would only make the allocator purge it.
-            std::mem::forget(owned);
+            // Freed here, the bucket's memory is reused by the sessions phase (no new pages).
+            drop(owned);
         },
     );
     drop(deduped);
     drop(ev_slots);
     log(start, "deduplicated events");
-
-    // ---- map users to persons and bucket by person: kept events (sequential over each
-    // thread's payload) and clicks, both cut into small ranges so no task is a straggler
-    const RANGE: usize = 32 * 1024;
-    let mut ranges: Vec<(bool, usize, usize, usize)> = Vec::new();
-    for (li, list) in ck_lists.iter().enumerate() {
-        for s in (0..list.len()).step_by(RANGE) {
-            ranges.push((true, li, s, (s + RANGE).min(list.len())));
-        }
-    }
-    for (t, pay) in payloads.iter().enumerate() {
-        for s in (0..pay.len()).step_by(RANGE) {
-            ranges.push((false, t, s, (s + RANGE).min(pay.len())));
-        }
-    }
-    // Person buckets small enough that a bucket's events, clicks and their sorted copies stay
-    // in L2 during the sessions phase.
-    let nq: usize = std::env::var("SS_NQ")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or((events_in.bytes() / 76 / 16384).next_power_of_two())
-        .clamp(64, 4096);
-    let sess_estimate = events_in.bytes() / 56 / nq / threads + 64;
-    let ck_bucket_estimate = clicks_in.bytes() / 30 / nq / threads + 64;
-    let regrouped = parallel(
-        "regroup",
-        threads,
-        ranges.len(),
-        || RegroupState {
-            sess: scatter::Scatter::new(nq, sess_estimate),
-            clicks: scatter::Scatter::new(nq, ck_bucket_estimate),
-        },
-        |st, task| {
-            let (is_click, li, s, e) = ranges[task];
-            if is_click {
-                let list = &ck_lists[li][s..e];
-                for i in 0..list.len() {
-                    if let Some(next) = list.get(i + 2 * PREFETCH) {
-                        persons.prefetch_filter(next.person);
-                    }
-                    if let Some(next) = list.get(i + PREFETCH) {
-                        persons.prefetch_slot(next.person);
-                    }
-                    let mut c = list[i];
-                    let person = persons.get(c.person);
-                    c.person = person;
-                    st.clicks.push(bucket(person, nq), c);
-                }
-                return;
-            }
-            let pay = &payloads[li][s..e];
-            let lost = &losers[li];
-            for i in 0..pay.len() {
-                if let Some(next) = pay.get(i + 2 * PREFETCH) {
-                    persons.prefetch_filter(next.user);
-                }
-                if let Some(next) = pay.get(i + PREFETCH) {
-                    persons.prefetch_slot(next.user);
-                }
-                let g = s + i;
-                if lost[g / 64].load(Ordering::Relaxed) >> (g % 64) & 1 != 0 {
-                    continue;
-                }
-                let p = pay[i];
-                let person = persons.get(p.user);
-                st.sess.push(bucket(person, nq), (person as u128) << 64 | (p.ts as u128) << 32 | p.pc as u128);
-            }
-        },
-    );
-    std::mem::forget(payloads);
-    std::mem::forget(ck_lists);
-    let mut sess_threads = Vec::with_capacity(regrouped.len());
-    let mut ck_threads = Vec::with_capacity(regrouped.len());
-    for st in regrouped {
-        sess_threads.push(st.sess.finish());
-        ck_threads.push(st.clicks.finish());
-    }
-    let sess_slots = regroup(sess_threads, nq);
-    let ck_slots = regroup(ck_threads, nq);
-    log(start, "regrouped by person");
+    let lost = |x: &PEv| {
+        let at = (x.tseq & ((1 << REF_BITS) - 1)) as usize;
+        losers[(x.tseq >> REF_BITS) as usize][at / 64].load(Ordering::Relaxed) >> (at % 64) & 1 != 0
+    };
 
     // ---- sessions, attribution, aggregation per person bucket, largest first
     let mut order: Vec<usize> = (0..nq).collect();
@@ -1193,12 +1206,15 @@ fn main() {
             let n_ev: usize = ev_pieces.iter().map(|p| p.len()).sum();
             // Bin by bits of hash(person) that `bucket` does not use: a person's events and
             // clicks share a bin, and a bin holds only a few persons, so sorting it is cheap.
+            // Copies that lost dedup are dropped on the way in.
             let nb = (n_ev / 8).next_power_of_two().clamp(16, 1 << 16);
             let bin = |p: Key| ((key::hash(p) >> 16) as usize) & (nb - 1);
-            let ev_slices: Vec<&[u128]> = ev_pieces.iter().map(|p| p.as_slice()).collect();
+            let ev_slices: Vec<&[PEv]> = ev_pieces.iter().map(|p| p.as_slice()).collect();
             let ck_slices: Vec<&[ClickRec]> = ck_pieces.iter().map(|p| p.as_slice()).collect();
-            let (mut evs, ev_at) = bin_scatter(&ev_slices, nb, |x: &u128| bin((x >> 64) as u64));
-            let (mut cks, ck_at) = bin_scatter(&ck_slices, nb, |c: &ClickRec| bin(c.person));
+            let (mut evs, ev_at) = bin_scatter(&ev_slices, nb, |x: &PEv| bin(x.person), |x: &PEv| !lost(x), |x: &PEv| {
+                (x.person as u128) << 64 | (x.ts as u128) << 32 | x.pc as u128
+            });
+            let (mut cks, ck_at) = bin_scatter(&ck_slices, nb, |c: &ClickRec| bin(c.person), |_| true, |c: &ClickRec| *c);
             drop(ev_slices);
             drop(ck_slices);
             drop(ev_pieces);
