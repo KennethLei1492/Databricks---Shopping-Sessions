@@ -20,7 +20,7 @@ use key::{pack, Key, KeyMap};
 use parquet::data_type::ByteArray;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 use ts::DAY;
@@ -38,7 +38,6 @@ const CHUNK: usize = 256 << 10;
 const INVALID: u32 = u32::MAX;
 const NONE: u32 = u32::MAX;
 const NO_CATEGORY: u16 = u16::MAX;
-const PREFETCH: usize = 16;
 
 /// Chunk size; SS_CHUNK overrides it so tests can force many chunk boundaries.
 fn chunk_size() -> usize {
@@ -139,7 +138,27 @@ struct Ctx {
 }
 
 fn log(start: Instant, what: &str) {
-    eprintln!("[{:>8.3}s] {what}", start.elapsed().as_secs_f64());
+    let (u, k) = cpu_times();
+    eprintln!("[{:>8.3}s] {what}   (cpu so far: user {u:.3}s, kernel {k:.3}s)", start.elapsed().as_secs_f64());
+}
+
+/// Process user and kernel CPU seconds so far (all threads).
+fn cpu_times() -> (f64, f64) {
+    #[repr(C)]
+    struct Rusage {
+        utime: [i64; 2],
+        stime: [i64; 2],
+        rest: [i64; 14],
+    }
+    extern "C" {
+        fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+    }
+    // SAFETY: getrusage(RUSAGE_SELF) fills the struct it is given.
+    unsafe {
+        let mut r: Rusage = std::mem::zeroed();
+        getrusage(0, &mut r);
+        (r.utime[0] as f64 + r.utime[1] as f64 / 1e6, r.stime[0] as f64 + r.stime[1] as f64 / 1e6)
+    }
 }
 
 /// Runs `work(state, task)` for tasks 0..n on `threads` threads, pulling tasks dynamically.
@@ -152,6 +171,7 @@ fn parallel<S: Send>(
     work: impl Fn(&mut S, usize) + Sync,
 ) -> Vec<S> {
     let next = AtomicUsize::new(0);
+    let (u0, s0) = cpu_times();
     let t0 = Instant::now();
     let results: Vec<(S, f64, f64, usize, f64)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
@@ -184,9 +204,12 @@ fn parallel<S: Send>(
     let busy: f64 = results.iter().map(|r| r.1).sum();
     let (longest, longest_task) = results.iter().map(|r| (r.2, r.3)).fold((0f64, 0), |a, b| if b.0 > a.0 { b } else { a });
     let slowest_start = results.iter().map(|r| r.4).fold(0f64, f64::max);
+    let (u1, s1) = cpu_times();
     eprintln!(
-        "  phase {name}: {n} tasks, wall {wall:.3}s, utilization {:.0}%, longest task #{longest_task} {longest:.3}s, slowest thread start {slowest_start:.3}s",
-        100.0 * busy / (threads as f64 * wall).max(1e-9)
+        "  phase {name}: {n} tasks, wall {wall:.3}s, utilization {:.0}%, user {:.3}s, kernel {:.3}s, longest task #{longest_task} {longest:.3}s, slowest thread start {slowest_start:.3}s",
+        100.0 * busy / (threads as f64 * wall).max(1e-9),
+        u1 - u0,
+        s1 - s0
     );
     results.into_iter().map(|r| r.0).collect()
 }
@@ -234,89 +257,92 @@ fn link_part(k: Key) -> usize {
 
 /// Person names for linked IDs that are not their person's name: one open-addressing table
 /// with key and name in the same slot (one cache miss per hit), behind a bitmap small enough to
-/// stay in cache that answers "not linked" for most other IDs without touching the table.
+/// stay in cache that answers "not linked" for most other IDs without touching the table. Built
+/// by many threads at once (slots claimed with compare-and-swap); read with relaxed loads, which
+/// are plain loads on x86.
 struct Persons {
-    slots: Vec<[u64; 2]>,
+    slots: Vec<[AtomicU64; 2]>,
     mask: usize,
-    filter: Vec<u64>,
+    filter: Vec<AtomicU64>,
     fmask: usize,
-    len: usize,
+    len: AtomicUsize,
 }
 
 impl Persons {
-    fn build(pairs: &[Vec<(Key, Key)>]) -> Persons {
-        let len: usize = pairs.iter().map(|p| p.len()).sum();
-        let cap = (2 * len).next_power_of_two().max(16);
-        let bits = (16 * len).next_power_of_two().max(1024);
-        let mut persons = Persons {
-            slots: vec![[key::EMPTY, 0]; cap],
+    fn with_capacity(n: usize) -> Persons {
+        let cap = (2 * n).next_power_of_two().max(16);
+        let bits = (16 * n).next_power_of_two().max(1024);
+        Persons {
+            slots: (0..cap).map(|_| [AtomicU64::new(key::EMPTY), AtomicU64::new(0)]).collect(),
             mask: cap - 1,
-            filter: vec![0; bits / 64],
+            filter: (0..bits / 64).map(|_| AtomicU64::new(0)).collect(),
             fmask: bits - 1,
-            len,
-        };
-        for list in pairs {
-            for (i, &(k, name)) in list.iter().enumerate() {
-                if let Some(&(next, _)) = list.get(i + PREFETCH) {
-                    persons.prefetch_slot_always(next);
-                }
-                let h = key::hash(k);
-                let fb = (h >> 20) as usize & persons.fmask;
-                persons.filter[fb / 64] |= 1 << (fb % 64);
-                let mut at = h as usize & persons.mask;
-                while persons.slots[at][0] != key::EMPTY {
-                    at = (at + 1) & persons.mask;
-                }
-                persons.slots[at] = [k, name];
-            }
+            len: AtomicUsize::new(0),
         }
-        persons
     }
 
+    /// Adds `k -> name`; safe to call from many threads at once (each key is added once).
     #[inline(always)]
-    fn get(&self, k: Key) -> Key {
+    fn insert(&self, k: Key, name: Key) {
         let h = key::hash(k);
         let fb = (h >> 20) as usize & self.fmask;
-        if self.filter[fb / 64] >> (fb % 64) & 1 == 0 {
-            return k;
-        }
+        self.filter[fb / 64].fetch_or(1 << (fb % 64), Ordering::Relaxed);
         let mut at = h as usize & self.mask;
         loop {
-            let s = self.slots[at];
-            if s[0] == k {
-                return s[1];
+            let slot = &self.slots[at];
+            if slot[0].compare_exchange(key::EMPTY, k, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                slot[1].store(name, Ordering::Relaxed);
+                self.len.fetch_add(1, Ordering::Relaxed);
+                return;
             }
-            if s[0] == key::EMPTY {
+            at = (at + 1) & self.mask;
+        }
+    }
+
+    /// The filter bit of a key with hash `h`: false means certainly not linked.
+    #[inline(always)]
+    fn maybe_linked(&self, h: u64) -> bool {
+        let fb = (h >> 20) as usize & self.fmask;
+        self.filter[fb / 64].load(Ordering::Relaxed) >> (fb % 64) & 1 != 0
+    }
+
+    /// The table lookup proper (the filter said the key may be linked).
+    #[inline(always)]
+    fn probe(&self, k: Key, h: u64) -> Key {
+        let mut at = h as usize & self.mask;
+        loop {
+            let s = &self.slots[at];
+            let found = s[0].load(Ordering::Relaxed);
+            if found == k {
+                return s[1].load(Ordering::Relaxed);
+            }
+            if found == key::EMPTY {
                 return k;
             }
             at = (at + 1) & self.mask;
         }
     }
 
-    /// First stage of a lookup pipeline: the filter word of `k`.
+    /// First stage of a lookup pipeline: the filter word of the key with hash `h`.
     #[inline(always)]
-    fn prefetch_filter(&self, k: Key) {
-        let fb = (key::hash(k) >> 20) as usize & self.fmask;
+    fn prefetch_filter(&self, h: u64) {
+        let fb = (h >> 20) as usize & self.fmask;
         prefetch(&self.filter[fb / 64]);
     }
 
-    /// Second stage: the table slot of `k`, if the filter says it may be linked.
+    /// Second stage: the table slot of the key with hash `h`, if the filter says it may be
+    /// linked. Returns that filter bit.
     #[inline(always)]
-    fn prefetch_slot(&self, k: Key) {
-        let h = key::hash(k);
-        let fb = (h >> 20) as usize & self.fmask;
-        if self.filter[fb / 64] >> (fb % 64) & 1 != 0 {
+    fn prefetch_slot(&self, h: u64) -> bool {
+        let maybe = self.maybe_linked(h);
+        if maybe {
             prefetch(&self.slots[h as usize & self.mask]);
         }
-    }
-
-    #[inline(always)]
-    fn prefetch_slot_always(&self, k: Key) {
-        prefetch(&self.slots[key::hash(k) as usize & self.mask]);
+        maybe
     }
 
     fn len(&self) -> usize {
-        self.len
+        self.len.load(Ordering::Relaxed)
     }
 }
 
@@ -336,17 +362,55 @@ struct PartIds {
     assign: Vec<(u32, u32)>, // (pair slot, local id)
 }
 
-/// Links -> person names, on the whole thread pool:
+/// Root of `x` in a union-find forest of atomic parent links, halving the path as it goes
+/// (a halving that loses a race to another thread is simply skipped).
+#[inline(always)]
+fn uf_find(parent: &[AtomicU32], mut x: u32) -> u32 {
+    loop {
+        let p = parent[x as usize].load(Ordering::Acquire);
+        if p == x {
+            return x;
+        }
+        let gp = parent[p as usize].load(Ordering::Acquire);
+        if gp != p {
+            let _ = parent[x as usize].compare_exchange_weak(p, gp, Ordering::AcqRel, Ordering::Relaxed);
+        }
+        x = gp;
+    }
+}
+
+/// Lock-free union: the root with the larger index is linked under the smaller one with a
+/// compare-and-swap, so concurrent unions can never form a cycle; a lost race retries.
+#[inline(always)]
+fn uf_union(parent: &[AtomicU32], a: u32, b: u32) {
+    let (mut a, mut b) = (a, b);
+    loop {
+        a = uf_find(parent, a);
+        b = uf_find(parent, b);
+        if a == b {
+            return;
+        }
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        if parent[hi as usize].compare_exchange(hi, lo, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            return;
+        }
+    }
+}
+
+/// Links -> person names, on the whole thread pool, with no serial step that grows with the data:
 ///   1. parse link files in parallel
-///   2. scatter (key, pair slot) into LINK_PARTS hash partitions
+///   2. scatter (key, pair slot) into LINK_PARTS hash partitions (in ranges, for balance)
 ///   3. per partition, in parallel: dense local IDs from a cache-sized map
-///   4. serial union-find (by size, path halving) over plain u32 arrays
-///   5. each component's name is its byte-wise smallest key
-///   6. per partition, in parallel: the map from non-name IDs to names
+///   4. fill pair -> ID arrays (partitions own disjoint slots)
+///   5. lock-free union-find over all pairs in parallel
+///   6. each component's name is its byte-wise smallest key: atomic minimum over fast-form keys
+///      (whose integer order is byte order), then a serial pass for the rare interned keys
+///   7. the table from non-name IDs to names, filled by all threads at once
 fn build_links(data: &Path, threads: usize) -> Persons {
+    const RANGE: usize = 32 * 1024;
     let t0 = Instant::now();
     let input = csv::Input::open(&csv::list_csv(&data.join("links")));
-    let chunks = input.chunks(chunk_size().min(1 << 20));
+    let chunks = input.chunks(chunk_size().min(256 << 10));
     struct LinkState {
         buf: Vec<u8>,
         pairs: Vec<(Key, Key)>,
@@ -369,20 +433,26 @@ fn build_links(data: &Path, threads: usize) -> Persons {
     let lists: Vec<Vec<(Key, Key)>> = parsed.into_iter().map(|s| s.pairs).collect();
     let mut offsets = Vec::with_capacity(lists.len());
     let mut total = 0usize;
-    for l in &lists {
+    let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
+    for (li, l) in lists.iter().enumerate() {
         offsets.push(total);
         total += l.len();
+        for s in (0..l.len()).step_by(RANGE) {
+            ranges.push((li, s, (s + RANGE).min(l.len())));
+        }
     }
     assert!(2 * total < u32::MAX as usize, "too many links");
 
     let scattered = parallel(
         "links-scatter",
         threads,
-        lists.len(),
+        ranges.len(),
         || (0..LINK_PARTS).map(|_| Vec::<(Key, u32)>::new()).collect::<Vec<_>>(),
-        |parts, li| {
+        |parts, task| {
+            let (li, s, e) = ranges[task];
             let base = 2 * offsets[li];
-            for (i, &(a, b)) in lists[li].iter().enumerate() {
+            for i in s..e {
+                let (a, b) = lists[li][i];
                 parts[link_part(a)].push((a, (base + 2 * i) as u32));
                 parts[link_part(b)].push((b, (base + 2 * i + 1) as u32));
             }
@@ -440,52 +510,59 @@ fn build_links(data: &Path, threads: usize) -> Persons {
     drop(parts);
     let t_fill = t0.elapsed().as_secs_f64();
 
-    // The only serial step: union by size with path halving; parent and size share a cache
-    // line, and each root keeps its component's byte-wise smallest key as it goes.
-    let mut node: Vec<[u32; 2]> = (0..n_ids as u32).map(|i| [i, 1]).collect();
-    let mut name: Vec<Key> = keys.clone();
-    #[inline(always)]
-    fn find(node: &mut [[u32; 2]], mut x: u32) -> u32 {
-        while node[x as usize][0] != x {
-            let up = node[node[x as usize][0] as usize][0];
-            node[x as usize][0] = up;
-            x = up;
+    // Union-find, lock-free, over all pairs in parallel.
+    let parent: Vec<AtomicU32> = (0..n_ids as u32).map(AtomicU32::new).collect();
+    let pair_tasks = total.div_ceil(RANGE).max(1);
+    parallel("links-union", threads, pair_tasks, || (), |_, t| {
+        let (s, e) = (t * RANGE, ((t + 1) * RANGE).min(total));
+        for i in s..e {
+            uf_union(&parent, slot_id[2 * i], slot_id[2 * i + 1]);
         }
-        x
-    }
-    for pair in slot_id.chunks_exact(2) {
-        let ra = find(&mut node, pair[0]);
-        let rb = find(&mut node, pair[1]);
-        if ra != rb {
-            let (big, small) = if node[ra as usize][1] >= node[rb as usize][1] { (ra, rb) } else { (rb, ra) };
-            node[small as usize][0] = big;
-            node[big as usize][1] += node[small as usize][1];
-            if key::cmp(name[small as usize], name[big as usize]).is_lt() {
-                name[big as usize] = name[small as usize];
-            }
-        }
-    }
+    });
     drop(slot_id);
     let t_union = t0.elapsed().as_secs_f64();
 
-    // Roots by read-only walks (trees are shallow after union by size), fused with building
-    // each partition's map from non-name IDs to names.
-    let pair_lists = parallel("links-names", threads, LINK_PARTS, Vec::new, |out: &mut Vec<(Key, Key)>, p| {
-        let (lo, hi) = (base[p] as usize, base[p + 1] as usize);
-        for id in lo..hi {
-            let mut r = id as u32;
-            while node[r as usize][0] != r {
-                r = node[r as usize][0];
-            }
-            let nm = name[r as usize];
-            if nm != keys[id] {
-                out.push((keys[id], nm));
+    // Roots and names. Fast-form keys compare as integers, so the minimum is an atomic
+    // fetch_min; interned keys (rare) are collected and compared by bytes afterwards.
+    let id_tasks = n_ids.div_ceil(RANGE).max(1);
+    let root: Vec<AtomicU32> = (0..n_ids).map(|_| AtomicU32::new(0)).collect();
+    let name: Vec<AtomicU64> = (0..n_ids).map(|_| AtomicU64::new(u64::MAX)).collect();
+    let slow = parallel("links-roots", threads, id_tasks, Vec::new, |slow: &mut Vec<(u32, Key)>, t| {
+        let (s, e) = (t * RANGE, ((t + 1) * RANGE).min(n_ids));
+        for i in s..e {
+            let r = uf_find(&parent, i as u32);
+            root[i].store(r, Ordering::Relaxed);
+            let k = keys[i];
+            if key::is_slow(k) {
+                slow.push((r, k));
+            } else {
+                name[r as usize].fetch_min(k, Ordering::Relaxed);
             }
         }
     });
-    let persons = Persons::build(&pair_lists);
+    for list in slow {
+        for (r, k) in list {
+            let cur = name[r as usize].load(Ordering::Relaxed);
+            if cur == u64::MAX || key::cmp(k, cur).is_lt() {
+                name[r as usize].store(k, Ordering::Relaxed);
+            }
+        }
+    }
+    drop(parent);
+
+    // The table from non-name IDs to names, by all threads at once.
+    let persons = Persons::with_capacity(n_ids);
+    parallel("links-names", threads, id_tasks, || (), |_, t| {
+        let (s, e) = (t * RANGE, ((t + 1) * RANGE).min(n_ids));
+        for i in s..e {
+            let nm = name[root[i].load(Ordering::Relaxed) as usize].load(Ordering::Relaxed);
+            if nm != keys[i] {
+                persons.insert(keys[i], nm);
+            }
+        }
+    });
     eprintln!(
-        "  links: {total} pairs, {n_ids} ids; ids {t_ids:.3}s, fill {:.3}s, union-find (serial) {:.3}s, name maps {:.3}s",
+        "  links: {total} pairs, {n_ids} ids; ids {t_ids:.3}s, fill {:.3}s, union-find (parallel) {:.3}s, names {:.3}s",
         t_fill - t_ids,
         t_union - t_fill,
         t0.elapsed().as_secs_f64() - t_union
@@ -951,6 +1028,7 @@ const MAX_THREADS: usize = 1 << (32 - REF_BITS);
 #[derive(Clone, Copy, Default)]
 struct EvPending {
     user: Key,
+    h: u64, // hash(user), computed once
     ts: u32,
     pc: u32,
     tseq: u32,
@@ -958,12 +1036,17 @@ struct EvPending {
 
 trait HasUser {
     fn user(&self) -> Key;
+    fn user_hash(&self) -> u64;
 }
 
 impl HasUser for EvPending {
     #[inline(always)]
     fn user(&self) -> Key {
         self.user
+    }
+    #[inline(always)]
+    fn user_hash(&self) -> u64 {
+        self.h
     }
 }
 
@@ -972,45 +1055,76 @@ impl HasUser for ClickRec {
     fn user(&self) -> Key {
         self.person // a parsed click holds its user ID here until the lookup
     }
+    #[inline(always)]
+    fn user_hash(&self) -> u64 {
+        self._pad // ... and the ID's hash here
+    }
 }
 
 const RING: usize = 8;
 
 /// A software pipeline for person lookups, run on the parsing threads. A record waits RING
-/// records between the start of its lookup (prefetch of the membership-filter word, then of the
-/// table slot) and its completion, so the lookup's memory latency overlaps the parsing of the
-/// records after it instead of stalling a separate phase.
+/// records between the start of its lookup and its completion, so the lookup's memory latency
+/// overlaps the parsing of the records after it instead of stalling a separate phase:
+///   enter:   prefetch the membership-filter word (the user's hash was computed once, at parse)
+///   halfway: read the filter bit (now cached); if set, prefetch the table slot
+///   leave:   most users are not linked (filter bit clear): their person is themselves and their
+///            bucket comes from the same hash; only the others probe the (prefetched) table.
+/// `done` gets the record, its person and the person's hash.
 struct Ring<T: Copy + Default + HasUser> {
     items: [T; RING],
+    maybe: [bool; RING],
     n: usize,
 }
 
 impl<T: Copy + Default + HasUser> Ring<T> {
     fn new() -> Self {
-        Ring { items: [T::default(); RING], n: 0 }
+        Ring { items: [T::default(); RING], maybe: [false; RING], n: 0 }
     }
 
     #[inline(always)]
-    fn push(&mut self, persons: &Persons, x: T, mut done: impl FnMut(T, Key)) {
-        persons.prefetch_filter(x.user());
+    fn resolve(persons: &Persons, x: &T, maybe: bool) -> (Key, u64) {
+        let (user, h) = (x.user(), x.user_hash());
+        if !maybe {
+            return (user, h);
+        }
+        let person = persons.probe(user, h);
+        (person, if person == user { h } else { key::hash(person) })
+    }
+
+    #[inline(always)]
+    fn push(&mut self, persons: &Persons, x: T, mut done: impl FnMut(T, Key, u64)) {
+        persons.prefetch_filter(x.user_hash());
         if self.n >= RING / 2 {
-            persons.prefetch_slot(self.items[(self.n - RING / 2) % RING].user());
+            let mid = (self.n - RING / 2) % RING;
+            self.maybe[mid] = persons.prefetch_slot(self.items[mid].user_hash());
         }
         if self.n >= RING {
-            let old = self.items[self.n % RING];
-            done(old, persons.get(old.user()));
+            let at = self.n % RING;
+            let old = self.items[at];
+            let (person, ph) = Self::resolve(persons, &old, self.maybe[at]);
+            done(old, person, ph);
         }
         self.items[self.n % RING] = x;
         self.n += 1;
     }
 
-    fn flush(&mut self, persons: &Persons, mut done: impl FnMut(T, Key)) {
+    fn flush(&mut self, persons: &Persons, mut done: impl FnMut(T, Key, u64)) {
         for i in self.n.saturating_sub(RING)..self.n {
             let old = self.items[i % RING];
-            done(old, persons.get(old.user()));
+            // The newest records never reached the halfway step: check their filter bit now.
+            let maybe = persons.maybe_linked(old.user_hash());
+            let (person, ph) = Self::resolve(persons, &old, maybe);
+            done(old, person, ph);
         }
         self.n = 0;
     }
+}
+
+/// The bucket of a key with hash `h` (the same bits `bucket` uses).
+#[inline(always)]
+fn bucket_h(h: u64, n: usize) -> usize {
+    ((h >> 40) as usize) % n
 }
 
 struct ParseState {
@@ -1110,9 +1224,9 @@ fn main() {
         |st, task| {
             let ParseState { thread, buf, events, sess, pcs, clicks, nseq, ev_ring, ck_ring } = st;
             let thread = *thread as u32;
-            let mut to_bucket = |x: EvPending, person: Key| {
+            let mut to_bucket = |x: EvPending, person: Key, ph: u64| {
                 let flag = if x.pc != 0 { PURCHASE } else { 0 };
-                sess.push(bucket(person, nq), PEv { person, ts: x.ts | flag, tseq: x.tseq });
+                sess.push(bucket_h(ph, nq), PEv { person, ts: x.ts | flag, tseq: x.tseq });
             };
             if task < ev_chunks.len() {
                 events_in.records::<7>(ev_chunks[task], buf, |f| {
@@ -1124,7 +1238,7 @@ fn main() {
                             let pref = thread << REF_BITS | *nseq as u32;
                             *nseq += 1;
                             pcs.push(rec.pc);
-                            let pending = EvPending { user: rec.user, ts: rec.ts, pc: rec.pc, tseq: pref };
+                            let pending = EvPending { user: rec.user, h: key::hash(rec.user), ts: rec.ts, pc: rec.pc, tseq: pref };
                             ev_ring.push(&persons, pending, &mut to_bucket);
                             pref
                         };
@@ -1133,12 +1247,14 @@ fn main() {
                 });
                 ev_ring.flush(&persons, &mut to_bucket);
             } else {
-                let mut click_to_bucket = |mut c: ClickRec, person: Key| {
+                let mut click_to_bucket = |mut c: ClickRec, person: Key, ph: u64| {
                     c.person = person;
-                    clicks.push(bucket(person, nq), c);
+                    c._pad = 0;
+                    clicks.push(bucket_h(ph, nq), c);
                 };
                 clicks_in.records::<4>(ck_chunks[task - ev_chunks.len()], buf, |f| {
-                    if let Some(rec) = parse_click(&ctx, f) {
+                    if let Some(mut rec) = parse_click(&ctx, f) {
+                        rec._pad = key::hash(rec.person); // the user's hash, for the lookup ring
                         ck_ring.push(&persons, rec, &mut click_to_bucket);
                     }
                 });
