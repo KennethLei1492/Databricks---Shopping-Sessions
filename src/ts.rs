@@ -93,7 +93,7 @@ pub fn parse(b: &[u8]) -> Option<i64> {
 pub fn parse_wide(w: &[u8; 16], b: &[u8]) -> Option<i64> {
     let n = b.len();
     if (n == 20 || n == 25) && b[4] == b'-' {
-        return civil_wide(w, b);
+        return civil_simd(b);
     }
     if (1..=16).contains(&n) {
         return digits16(w, n).map(|v| v as i64);
@@ -146,50 +146,85 @@ fn digits16(w: &[u8; 16], len: usize) -> Option<u64> {
     }
 }
 
-/// F1 / F2 with the `YYYY-MM-DDTHH:MM` head checked and converted in one SIMD pass.
+/// (days since the epoch of the first of the month, days in the month), 1900-01 to 2199-12.
+static MONTHS: [(i32, u32); TABLE_YEARS * 12] = {
+    let mut t = [(0i32, 0u32); TABLE_YEARS * 12];
+    let mut i = 0;
+    while i < TABLE_YEARS * 12 {
+        let (y, m) = (TABLE_FIRST_YEAR as i64 + (i / 12) as i64, (i % 12) as i64 + 1);
+        let first = days_from_civil(y, m, 1);
+        let next = if m == 12 { days_from_civil(y + 1, 1, 1) } else { days_from_civil(y, m + 1, 1) };
+        t[i] = (first as i32, (next - first) as u32);
+        i += 1;
+    }
+    t
+};
+
+/// F1 / F2 (`b` is 20 or 25 bytes): `-MM-DDTHH:MM:SS` is checked and converted in one 16-byte
+/// SIMD pass (separators, digits, ranges, time of day), the year with a 4-byte integer trick, and
+/// the date through one table entry.
 #[cfg(all(target_feature = "avx2", target_feature = "bmi2"))]
 #[inline(always)]
-fn civil_wide(w: &[u8; 16], b: &[u8]) -> Option<i64> {
+fn civil_simd(b: &[u8]) -> Option<i64> {
     use std::arch::x86_64::*;
-    const DIGITS: u32 = 0b1101_1011_0110_1111; // lanes 0-3, 5-6, 8-9, 11-12, 14-15
-    const SEPS: u32 = 0b0010_0100_1001_0000; // lanes 4, 7, 10, 13
-    // SAFETY: AVX2 is enabled at compile time (cfg above); loads are unaligned-safe.
-    let (year, month, day, hour, minute) = unsafe {
-        let v = _mm_loadu_si128(w.as_ptr() as *const __m128i);
-        let template = _mm_setr_epi8(0, 0, 0, 0, b'-' as i8, 0, 0, b'-' as i8, 0, 0, b'T' as i8, 0, 0, b':' as i8, 0, 0);
+    const SEPS: u32 = 0b0001_0010_0100_1001; // body bytes 0, 3, 6, 9, 12
+    const DIGITS: u32 = 0b0110_1101_1011_0110; // body bytes 1-2, 4-5, 7-8, 10-11, 13-14
+    let y = u32::from_le_bytes(b[..4].try_into().unwrap()).wrapping_sub(0x3030_3030);
+    // A byte above 9 sets its top bit, in y itself or after adding 118.
+    let y_bad = (y | y.wrapping_add(0x7676_7676)) & 0x8080_8080;
+    let year = (y & 0xFF) * 1000 + (y >> 8 & 0xFF) * 100 + (y >> 16 & 0xFF) * 10 + (y >> 24);
+    let body: &[u8; 16] = b[4..20].try_into().unwrap();
+    // SAFETY: AVX2 (and so SSE4.1) is enabled at compile time (cfg above); loads are unaligned-safe.
+    let (month, day, secs) = unsafe {
+        let v = _mm_loadu_si128(body.as_ptr() as *const __m128i);
+        let (dash, tee, colon) = (b'-' as i8, b'T' as i8, b':' as i8);
+        let template = _mm_setr_epi8(dash, 0, 0, dash, 0, 0, tee, 0, 0, colon, 0, 0, colon, 0, 0, 0);
         let seps = _mm_movemask_epi8(_mm_cmpeq_epi8(v, template)) as u32;
         let d = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
         let digits = _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d)) as u32;
-        if digits & DIGITS != DIGITS || seps & SEPS != SEPS {
+        if (seps & SEPS != SEPS) | (digits & DIGITS != DIGITS) | (y_bad != 0) {
             return None;
         }
-        let gather = _mm_setr_epi8(0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, -128, -128, -128, -128);
-        let pairs = _mm_maddubs_epi16(_mm_shuffle_epi8(d, gather), _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0));
-        let a = _mm_cvtsi128_si64(pairs) as u64;
-        let c = _mm_extract_epi64::<1>(pairs) as u64;
-        let year = (a & 0xFFFF) as u32 * 100 + (a >> 16 & 0xFFFF) as u32;
-        (year, (a >> 32 & 0xFFFF) as u32, (a >> 48) as u32, (c & 0xFFFF) as u32, (c >> 16 & 0xFFFF) as u32)
+        let gather = _mm_setr_epi8(1, 2, 4, 5, 7, 8, 10, 11, 13, 14, -128, -128, -128, -128, -128, -128);
+        // u16 lanes: month, day, hour, minute, second, 0, 0, 0
+        let pairs = _mm_maddubs_epi16(_mm_shuffle_epi8(d, gather), _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0));
+        // month 1..=12, day 1..=31, hour <= 23, minute <= 59, second <= 59: after subtracting the
+        // minimum (wrapping), anything above the span leaves a non-zero saturated difference.
+        let shifted = _mm_sub_epi16(pairs, _mm_setr_epi16(1, 1, 0, 0, 0, 0, 0, 0));
+        let over = _mm_subs_epu16(shifted, _mm_setr_epi16(11, 30, 23, 59, 59, 0, 0, 0));
+        if _mm_testz_si128(over, over) == 0 {
+            return None;
+        }
+        // i32 lanes: 0, hour * 3600 + minute * 60, second, 0
+        let tod = _mm_madd_epi16(pairs, _mm_setr_epi16(0, 0, 3600, 60, 1, 0, 0, 0));
+        (
+            _mm_extract_epi16::<0>(pairs) as u32,
+            _mm_extract_epi16::<1>(pairs) as u32,
+            (_mm_extract_epi32::<1>(tod) + _mm_extract_epi32::<2>(tod)) as i64,
+        )
     };
-    let (s0, s1) = (b[17].wrapping_sub(b'0'), b[18].wrapping_sub(b'0'));
-    if (s0 > 9) | (s1 > 9) | (b[16] != b':') {
-        return None;
-    }
-    finish(year, month, day, hour, minute, (s0 * 10 + s1) as u32, &b[19..])
-}
-
-/// Range checks, the zone, and the conversion to epoch milliseconds.
-#[inline(always)]
-fn finish(year: u32, month: u32, day: u32, hour: u32, minute: u32, second: u32, zone: &[u8]) -> Option<i64> {
-    if month.wrapping_sub(1) > 11 || day == 0 || day > days_in_month(year, month) || hour > 23 || minute > 59 || second > 59 {
-        return None;
-    }
-    let offset_minutes: i64 = if zone.len() == 1 {
-        if zone[0] != b'Z' {
+    let at = (year.wrapping_sub(TABLE_FIRST_YEAR) as usize) * 12 + month as usize - 1;
+    let days = match MONTHS.get(at) {
+        Some(&(first, len)) => {
+            if day > len {
+                return None;
+            }
+            first as i64 + day as i64 - 1
+        }
+        None => {
+            if day > days_in_month(year, month) {
+                return None;
+            }
+            days_from_civil(year as i64, month as i64, day as i64)
+        }
+    };
+    let offset_minutes: i64 = if b.len() == 20 {
+        if b[19] != b'Z' {
             return None;
         }
         0
     } else {
-        let z: &[u8; 6] = zone.try_into().ok()?;
+        let z: &[u8; 6] = b[19..].try_into().ok()?;
         let sign = match z[0] {
             b'+' => 1,
             b'-' => -1,
@@ -205,9 +240,7 @@ fn finish(year: u32, month: u32, day: u32, hour: u32, minute: u32, second: u32, 
         }
         sign * (oh * 60 + om)
     };
-    let days = days(year, month, day);
-    let local = (days * 86_400 + hour as i64 * 3_600 + minute as i64 * 60 + second as i64) * SECOND;
-    Some(local - offset_minutes * 60 * SECOND)
+    Some((days * 86_400 + secs) * SECOND - offset_minutes * 60 * SECOND)
 }
 
 /// F1 / F2 on a fixed-size head (no bounds checks); `zone` is `Z` or `+HH:MM` / `-HH:MM`.
@@ -388,6 +421,40 @@ mod tests {
                 v.truncate((next() % (v.len() as u64 + 1)) as usize);
             }
             assert_eq!(parse(&v), oracle(&v), "{:?}", String::from_utf8_lossy(&v));
+        }
+    }
+
+    /// Every calendar and clock edge, against the straightforward parser.
+    #[test]
+    fn wide_parser_grid() {
+        let check = |text: String| {
+            let v = text.as_bytes();
+            let mut w = [b'7'; 16];
+            let n = v.len().min(16);
+            w[..n].copy_from_slice(&v[..n]);
+            assert_eq!(parse_wide(&w, v), parse_civil(v), "{text}");
+        };
+        for year in [0u32, 1899, 1900, 2000, 2023, 2024, 2027, 2028, 2100, 2199, 2200, 2400, 9999] {
+            for month in 0..20 {
+                for day in 0..40 {
+                    check(format!("{year:04}-{month:02}-{day:02}T12:34:56Z"));
+                    check(format!("{year:04}-{month:02}-{day:02}T00:00:00+05:30"));
+                }
+            }
+        }
+        for hour in 0..30 {
+            for minute in [0, 1, 30, 59, 60, 61, 99] {
+                for second in [0, 1, 59, 60, 99] {
+                    check(format!("2026-10-03T{hour:02}:{minute:02}:{second:02}Z"));
+                    check(format!("2026-10-03T{hour:02}:{minute:02}:{second:02}-10:00"));
+                }
+            }
+        }
+        for oh in 0..30 {
+            for om in [0, 30, 45, 59, 60, 99] {
+                check(format!("2028-02-29T23:59:59+{oh:02}:{om:02}"));
+                check(format!("2028-02-29T00:00:00-{oh:02}:{om:02}"));
+            }
         }
     }
 

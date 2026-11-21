@@ -228,101 +228,159 @@ fn masks(block: &[u8; 64]) -> (u64, u64, u64) {
     (nl, comma, quote)
 }
 
-/// Splits `data[start..len]` into lines and fields with one bitmask pass; `data` must hold SLACK
-/// bytes past `len`. A line is well-formed when it has exactly N-1 commas and every quote is the
-/// first or last byte of a field that starts and ends with one (length >= 2): then the line's
-/// quote count is exactly 2 per quoted field.
-pub fn parse_records<const N: usize>(data: &[u8], len: usize, start: usize, f: &mut impl FnMut(&Rec<'_, N>)) {
-    const { assert!(N >= 2 && N <= 16) };
-    assert!(data.len() >= len + SLACK);
-    let mut cuts = [0usize; 16];
-    let mut commas = 0usize;
-    let mut line_start = start;
-    let mut quotes_before = 0u32; // quote bytes of the current line in earlier blocks
-    let mut block_at = start;
-    let mut tail = [0u8; 64];
-    while block_at < len {
-        let block: &[u8; 64] = if block_at + 64 <= len {
-            data[block_at..block_at + 64].try_into().unwrap()
-        } else {
-            tail.fill(0);
-            tail[..len - block_at].copy_from_slice(&data[block_at..len]);
-            &tail
-        };
-        let (nl, comma, quote) = masks(block);
-        let mut seps = nl | comma;
-        let mut quotes_left = quote;
-        while seps != 0 {
-            let b = seps.trailing_zeros();
-            seps &= seps - 1;
-            let bit = 1u64 << b;
-            let pos = block_at + b as usize;
-            if comma & bit != 0 {
-                if commas < N - 1 {
-                    cuts[commas] = pos;
-                }
-                commas += 1;
-            } else {
-                let below = bit - 1;
-                let q = quotes_before + (quotes_left & below).count_ones();
-                quotes_left &= !(below | bit);
-                quotes_before = 0;
-                emit::<N>(data, line_start, pos, &cuts, commas, q, f);
-                commas = 0;
-                line_start = pos + 1;
-            }
-        }
-        quotes_before += quotes_left.count_ones();
-        block_at += 64;
+/// `x` with bits `n` and above cleared; all of `x` when `n >= 64`.
+#[inline(always)]
+fn low_bits(x: u64, n: usize) -> u64 {
+    #[cfg(target_feature = "bmi2")]
+    // SAFETY: BMI2 is enabled at compile time (cfg above). BZHI keeps `x` for an index >= 64;
+    // callers pass n < 256, the range of the index byte it reads.
+    unsafe {
+        std::arch::x86_64::_bzhi_u64(x, n as u32)
     }
-    // A last line without its newline is still a line.
-    if line_start < len {
-        emit::<N>(data, line_start, len, &cuts, commas, quotes_before, f);
+    #[cfg(not(target_feature = "bmi2"))]
+    if n >= 64 {
+        x
+    } else {
+        x & ((1u64 << n) - 1)
     }
 }
 
+/// Splits `data[start..len]` into lines and fields; `data` must hold SLACK bytes past `len`.
+/// A line is well-formed when it has exactly N-1 commas and every quote is the first or last
+/// byte of a field that starts and ends with one (length >= 2): then the line's quote count is
+/// exactly 2 per quoted field.
+///
+/// Line by line, from the bitmasks of the 128 bytes at the line's start: the newline is one
+/// trailing-zero count, the field count one popcount, and the N-1 comma positions come out with
+/// conditional moves, so a well-formed line runs no data-dependent branch or loop. A line with no
+/// newline in its first 128 bytes (very long, or a file's last line without one) takes the simple
+/// `split` path.
+pub fn parse_records<const N: usize>(data: &[u8], len: usize, start: usize, f: &mut impl FnMut(&Rec<'_, N>)) {
+    const { assert!(N >= 2 && N <= 16) };
+    assert!(data.len() >= len + SLACK);
+    let mut ls = start;
+    let mut pad = [0u8; 128];
+    while ls < len {
+        // The window must not show bytes past `len` (another chunk's lines, or stale buffer).
+        let window: &[u8; 128] = if ls + 128 <= len {
+            data[ls..ls + 128].try_into().unwrap()
+        } else {
+            pad.fill(0);
+            pad[..len - ls].copy_from_slice(&data[ls..len]);
+            &pad
+        };
+        let (n0, c0, q0) = masks(window[..64].try_into().unwrap());
+        // Short records (links, clicks) nearly always end in the first word; event lines are
+        // split evenly around 64 bytes, so they always take both words (no branch to mispredict).
+        let (n1, c1, q1) = if N >= 5 || n0 == 0 { masks(window[64..].try_into().unwrap()) } else { (0, 0, 0) };
+        // One place hands records on (`f` is called from a single site, so it can be inlined).
+        let mut at = [(0usize, 0usize); N];
+        let ok;
+        if n0 | n1 == 0 {
+            let end = memchr(NL, &data[ls..len]).map_or(len, |p| ls + p);
+            ok = slow_line::<N>(data, ls, end, &mut at);
+            ls = end + 1;
+        } else {
+            let t0 = n0.trailing_zeros() as usize;
+            let nl = t0 + if t0 == 64 { n1.trailing_zeros() as usize } else { 0 };
+            let nl_hi = nl.saturating_sub(64);
+            let mut lo = low_bits(c0, nl);
+            let mut hi = low_bits(c1, nl_hi);
+            let commas = (lo.count_ones() + hi.count_ones()) as usize;
+            let (quoted, quotes_ok) = quoted_fields(lo, hi, low_bits(q0, nl), low_bits(q1, nl_hi), nl);
+            // The next comma: from the low word while it has one, then from the high word, without
+            // a branch (trailing_zeros of 0 is 64, and x & (x - 0) leaves x unchanged).
+            // A quoted field (bit i of `quoted`) loses its first and last byte.
+            let mut s = ls;
+            for (i, r) in at.iter_mut().enumerate().take(N - 1) {
+                let lo_empty = (lo == 0) as u64;
+                let pos = lo.trailing_zeros() as usize + (hi.trailing_zeros() as usize & 0usize.wrapping_sub(lo_empty as usize));
+                hi &= hi.wrapping_sub(lo_empty);
+                lo &= lo.wrapping_sub(1);
+                let e = ls + pos;
+                let q = (quoted >> i) as usize & 1;
+                *r = (s + q, e - q);
+                s = e + 1;
+            }
+            let q = (quoted >> (N - 1)) as usize & 1;
+            at[N - 1] = (s + q, ls + nl - q);
+            ok = commas == N - 1 && quotes_ok;
+            ls += nl + 1;
+        }
+        if ok {
+            f(&Rec { data, at });
+        }
+    }
+}
+
+/// The bits of `x` selected by `mask`, packed into the low bits.
 #[inline(always)]
-fn emit<const N: usize>(
-    data: &[u8],
-    line_start: usize,
-    line_end: usize,
-    cuts: &[usize; 16],
-    commas: usize,
-    quotes: u32,
-    f: &mut impl FnMut(&Rec<'_, N>),
-) {
-    if commas != N - 1 {
-        return; // wrong field count; an empty line has 0 commas
+fn pext(x: u64, mask: u64) -> u64 {
+    #[cfg(target_feature = "bmi2")]
+    // SAFETY: BMI2 is enabled at compile time (cfg above).
+    unsafe {
+        std::arch::x86_64::_pext_u64(x, mask)
     }
-    let mut at = [(0usize, 0usize); N];
-    let mut s = line_start;
-    for (i, r) in at.iter_mut().enumerate() {
-        let e = if i < N - 1 { cuts[i] } else { line_end };
-        *r = (s, e);
-        s = e + 1;
+    #[cfg(not(target_feature = "bmi2"))]
+    {
+        let (mut out, mut m, mut k) = (0u64, mask, 0);
+        while m != 0 {
+            out |= (x >> m.trailing_zeros() & 1) << k;
+            k += 1;
+            m &= m - 1;
+        }
+        out
     }
-    // Strip fields that start with a quote (they must end with one and be at least 2 long). Any
-    // other quote (inside, or only at the end) leaves the count unmatched. Branch-free: about a
-    // fifth of fields are quoted at random, so a branch per field would mispredict constantly.
-    if quotes == 0 {
-        f(&Rec { data, at });
-        return;
+}
+
+/// Which fields of a line are wrapped in quotes (bit i = field i), and whether every quote in the
+/// line is such a wrapper. Works on the line's 128-bit comma and quote masks (`*_lo` are bytes
+/// 0..64 from the line start, `*_hi` bytes 64..128; all bits at or after the newline at `nl` are
+/// already cleared), so it loads no bytes and has no loop over fields.
+///
+/// A field is fine when it has no quote, or starts and ends with one, is at least 2 long and has
+/// none in between. So with ST = field starts and SEP = the separator ending each field:
+///   opens  = quotes at a field start                          (bit at the field start)
+///   closes = quotes immediately before a separator            (bit at the separator)
+/// the line is fine when the fields that open are exactly the fields that close, every quote is
+/// one or the other, and no quote is both (a field that is a single quote).
+#[inline(always)]
+fn quoted_fields(c_lo: u64, c_hi: u64, q_lo: u64, q_hi: u64, nl: usize) -> (u64, bool) {
+    let nl_bit = 1u64 << (nl & 63);
+    let sep_lo = c_lo | (nl_bit & ((nl < 64) as u64).wrapping_neg());
+    let sep_hi = c_hi | (nl_bit & ((nl >= 64) as u64).wrapping_neg());
+    let st_lo = c_lo << 1 | 1;
+    let st_hi = c_hi << 1 | c_lo >> 63;
+    let open_lo = q_lo & st_lo;
+    let open_hi = q_hi & st_hi;
+    // Quotes moved up one byte meet the separator that follows them.
+    let close_lo = (q_lo << 1) & sep_lo;
+    let close_hi = (q_hi << 1 | q_lo >> 63) & sep_hi;
+    let opens = pext(open_lo, st_lo) | pext(open_hi, st_hi).wrapping_shl(st_lo.count_ones());
+    let closes = pext(close_lo, sep_lo) | pext(close_hi, sep_hi).wrapping_shl(sep_lo.count_ones());
+    // The closing quotes, back at their own positions.
+    let closing_lo = close_lo >> 1 | close_hi << 63;
+    let closing_hi = close_hi >> 1;
+    let stray = (q_lo & !(open_lo | closing_lo)) | (q_hi & !(open_hi | closing_hi));
+    // A quote that both opens and closes: its separator comes right after a field start.
+    let lone = (close_lo & (st_lo << 1)) | (close_hi & (st_hi << 1 | st_lo >> 63));
+    (opens, (opens == closes) & (stray == 0) & (lone == 0))
+}
+
+/// One line through the simple splitter (a very long line, or a last line without a newline).
+#[cold]
+fn slow_line<const N: usize>(data: &[u8], line_start: usize, line_end: usize, at: &mut [(usize, usize); N]) -> bool {
+    match split::<N>(&data[line_start..line_end]) {
+        Some(fields) => {
+            let base = data.as_ptr() as usize;
+            for (r, field) in at.iter_mut().zip(fields.iter()) {
+                let s = field.as_ptr() as usize - base;
+                *r = (s, s + field.len());
+            }
+            true
+        }
+        None => false,
     }
-    let mut stripped = 0u32;
-    let mut bad = 0usize;
-    for r in at.iter_mut() {
-        let (s, e) = *r;
-        // data[s] is readable even for an empty field (SLACK bytes follow the data).
-        let first = (e > s) as usize & (data[s] == b'"') as usize;
-        let last_ok = (e >= s + 2) as usize & (data[e.max(1) - 1] == b'"') as usize;
-        bad |= first & (last_ok ^ 1);
-        *r = (s + first, e - first);
-        stripped += 2 * first as u32;
-    }
-    if bad != 0 || stripped != quotes {
-        return;
-    }
-    f(&Rec { data, at });
 }
 
 /// Splits a line into exactly N fields and strips whole-field quotes; None if malformed.
@@ -386,9 +444,24 @@ mod tests {
             x ^= x << 17;
             x
         };
-        for _ in 0..2_000 {
+        for case in 0..2_000 {
             let len = (next() % 400) as usize;
-            let data: Vec<u8> = (0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
+            let mut data: Vec<u8> = (0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
+            if case % 2 == 1 {
+                // Long lines: most newlines, commas and quotes become letters, so lines run
+                // 60 to 300 bytes and cross the splitter's 64- and 128-byte boundaries.
+                for c in data.iter_mut() {
+                    let keep = match *c {
+                        NL => next() % 8 == 0,
+                        b',' => next() % 3 == 0,
+                        b'"' => next() % 6 == 0,
+                        _ => true,
+                    };
+                    if !keep {
+                        *c = b'x';
+                    }
+                }
+            }
             let start = (next() % (len as u64 + 1)) as usize;
             let mut expected: Vec<Vec<Vec<u8>>> = Vec::new();
             let body = &data[start..];
