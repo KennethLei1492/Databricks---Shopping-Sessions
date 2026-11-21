@@ -867,6 +867,37 @@ fn slot_len<B: Bucket>(slot: &Mutex<Vec<B>>) -> usize {
     slot.lock().unwrap().iter().map(|p| p.count()).sum()
 }
 
+/// Allocates and touches about SS_PREFAULT (default 0.75) bytes per byte of event and click
+/// input, then frees it, so the allocator holds that much already-faulted memory.
+fn prefault(data: &Path) {
+    let t = Instant::now();
+    let ratio: f64 = std::env::var("SS_PREFAULT").ok().and_then(|v| v.parse().ok()).unwrap_or(0.75);
+    let input: u64 = ["events", "clicks"]
+        .iter()
+        .flat_map(|d| csv::list_csv(&data.join(d)))
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
+    let bytes = (input as f64 * ratio) as usize;
+    if bytes < (64 << 20) {
+        return;
+    }
+    // Several blocks rather than one, so the freed memory is reused by ordinary-sized allocations.
+    const BLOCK: usize = 64 << 20;
+    let mut blocks: Vec<Vec<u8>> = Vec::with_capacity(bytes / BLOCK + 1);
+    for _ in 0..bytes / BLOCK {
+        let mut b: Vec<u8> = Vec::with_capacity(BLOCK);
+        let p = b.as_mut_ptr();
+        for at in (0..BLOCK).step_by(4096) {
+            // SAFETY: within the allocation; a volatile write so the touch is not optimized out.
+            unsafe { std::ptr::write_volatile(p.add(at), 0) };
+        }
+        blocks.push(b);
+    }
+    drop(blocks);
+    eprintln!("  prefault: {} MB in {:.3}s", bytes >> 20, t.elapsed().as_secs_f64());
+}
+
 /// Single-threaded micro-benchmarks of the event parse path (SS_BENCH=lines|split|event).
 fn bench(ctx: &Ctx, data: &Path, mode: &str) {
     let input = csv::Input::open(&csv::list_csv(&data.join("events")));
@@ -1013,6 +1044,11 @@ fn main() {
     // ---- links on the whole pool (parsing needs them: events and clicks go straight to their
     // person's bucket), while one more thread loads the lookups and plans the input chunks
     let ((ctx, events_in, clicks_in, ev_chunks, ck_chunks), persons) = std::thread::scope(|scope| {
+        // Fault in the memory the parse phase will fill, from one thread, while links run. Page
+        // faults from many threads at once contend in the kernel (kernel time grew 2.5 s -> 9.6 s
+        // from 1 to 8 threads); one thread faulting does not. With purging off, the allocator
+        // hands these already-mapped pages out again after they are freed.
+        scope.spawn(|| prefault(&data));
         let setup = scope.spawn(|| {
             let ctx = load_context(&data, start);
             let events_in = csv::Input::open(&csv::list_csv(&data.join("events")));
