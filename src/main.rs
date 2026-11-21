@@ -72,6 +72,10 @@ struct ClickRec {
 /// zeros) are found by array index; any other ID goes through a hash map.
 struct IdLookup {
     prefix: Vec<u8>,
+    // The prefix as the low bytes of a little-endian word, and the mask of those bytes (for
+    // prefixes of at most 8 bytes; pmask = 0 otherwise, which turns the fast path off).
+    pword: u64,
+    pmask: u64,
     dense: Vec<u32>,
     other: HashMap<Vec<u8>, u32>,
 }
@@ -97,7 +101,14 @@ fn canonical_number(s: &[u8], prefix: &[u8]) -> Option<usize> {
 impl IdLookup {
     fn build(rows: &[(&[u8], u32)]) -> IdLookup {
         let prefix: Vec<u8> = rows.first().map_or(Vec::new(), |r| r.0.iter().take_while(|c| !c.is_ascii_digit()).copied().collect());
-        let mut lookup = IdLookup { prefix, dense: Vec::new(), other: HashMap::new() };
+        let (pword, pmask) = if (1..=8).contains(&prefix.len()) {
+            let mut w = [0u8; 8];
+            w[..prefix.len()].copy_from_slice(&prefix);
+            (u64::from_le_bytes(w), u64::MAX >> (64 - 8 * prefix.len()))
+        } else {
+            (0, 0)
+        };
+        let mut lookup = IdLookup { prefix, pword, pmask, dense: Vec::new(), other: HashMap::new() };
         for &(id, v) in rows {
             match canonical_number(id, &lookup.prefix).filter(|&n| n < DENSE_LIMIT) {
                 Some(n) => {
@@ -112,6 +123,28 @@ impl IdLookup {
             }
         }
         lookup
+    }
+
+    /// `get(s)`, where `w` holds the 16 bytes starting at `s`: the prefix is one masked word
+    /// compare and the number a branch-free digit loop; anything else goes through `get`.
+    #[inline(always)]
+    fn get_wide(&self, w: &[u8; 16], s: &[u8]) -> Option<u32> {
+        let pl = self.prefix.len();
+        let word = u64::from_le_bytes(w[..8].try_into().unwrap());
+        if self.pmask != 0 && s.len() > pl && s.len() - pl <= 9 && word & self.pmask == self.pword && s[pl] != b'0' {
+            let mut n = 0usize;
+            let mut ok = true;
+            for &c in &s[pl..] {
+                let d = c.wrapping_sub(b'0');
+                ok &= d <= 9;
+                n = n.wrapping_mul(10).wrapping_add(d as usize);
+            }
+            if ok && n < self.dense.len() {
+                let v = self.dense[n];
+                return (v != NONE).then_some(v);
+            }
+        }
+        self.get(s)
     }
 
     #[inline]
@@ -583,7 +616,7 @@ fn parse_event(ctx: &Ctx, r: &csv::Rec<'_, 7>) -> Option<EvRec> {
     if eid.is_empty() {
         return None;
     }
-    let ingest_ms = ts::parse_wide(r.wide(3), r.get(3));
+    let ingest_ms = ts::parse_trusted_f1(r.wide(3), r.get(3));
     let ingest = match ingest_ms {
         Some(ms) => (ms.div_euclid(1000) - ctx.ingest_base_s).clamp(0, u32::MAX as i64 - 1) as u32,
         None => u32::MAX,
@@ -606,7 +639,7 @@ fn parse_event(ctx: &Ctx, r: &csv::Rec<'_, 7>) -> Option<EvRec> {
     }
     if purchase {
         let Some(price) = parse_price(r.get(6)) else { return Some(rec) };
-        let cat = ctx.products.get(r.get(5)).unwrap_or(ctx.unknown);
+        let cat = ctx.products.get_wide(r.wide(5), r.get(5)).unwrap_or(ctx.unknown);
         rec.pc = price << 8 | cat;
     }
     rec.user = key::pack_wide(r.wide(1), r.get(1));
@@ -616,16 +649,21 @@ fn parse_event(ctx: &Ctx, r: &csv::Rec<'_, 7>) -> Option<EvRec> {
 
 #[inline]
 fn parse_click(ctx: &Ctx, r: &csv::Rec<'_, 4>) -> Option<ClickRec> {
-    let f = r.fields();
-    if f[0].is_empty() || f[1].is_empty() {
+    if r.len(0) == 0 || r.len(1) == 0 {
         return None;
     }
-    let camp = ctx.campaigns.get(f[2])?;
-    let t = ts::parse_wide(r.wide(3), f[3])?;
+    let camp = ctx.campaigns.get_wide(r.wide(2), r.get(2))?;
+    let t = ts::parse_wide(r.wide(3), r.get(3))?;
     if t < ctx.click_base || t >= ctx.we {
         return None;
     }
-    Some(ClickRec { person: key::pack_wide(r.wide(1), f[1]), cid: key::pack_wide(r.wide(0), f[0]), ts: (t - ctx.click_base) as u32, camp, _pad: 0 })
+    Some(ClickRec {
+        person: key::pack_wide(r.wide(1), r.get(1)),
+        cid: key::pack_wide(r.wide(0), r.get(0)),
+        ts: (t - ctx.click_base) as u32,
+        camp,
+        _pad: 0,
+    })
 }
 
 struct UserRow {

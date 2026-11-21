@@ -243,6 +243,45 @@ fn civil_simd(b: &[u8]) -> Option<i64> {
     Some((days * 86_400 + secs) * SECOND - offset_minutes * 60 * SECOND)
 }
 
+/// `ingest_ts`, which rules.md guarantees is always valid F1: a 20-byte value is converted
+/// without the separator, digit and range checks of `civil_simd`; any other length (never
+/// produced) goes through `parse_wide`, so it is still rejected or read correctly.
+#[cfg(all(target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+pub fn parse_trusted_f1(w: &[u8; 16], b: &[u8]) -> Option<i64> {
+    use std::arch::x86_64::*;
+    if b.len() != 20 {
+        return parse_wide(w, b);
+    }
+    let y = u32::from_le_bytes(b[..4].try_into().unwrap()).wrapping_sub(0x3030_3030);
+    let year = (y & 0xFF) * 1000 + (y >> 8 & 0xFF) * 100 + (y >> 16 & 0xFF) * 10 + (y >> 24);
+    let body: &[u8; 16] = b[4..20].try_into().unwrap();
+    // SAFETY: AVX2 (and so SSE4.1) is enabled at compile time (cfg above); loads are unaligned-safe.
+    let (month, day, secs) = unsafe {
+        let d = _mm_sub_epi8(_mm_loadu_si128(body.as_ptr() as *const __m128i), _mm_set1_epi8(b'0' as i8));
+        let gather = _mm_setr_epi8(1, 2, 4, 5, 7, 8, 10, 11, 13, 14, -128, -128, -128, -128, -128, -128);
+        let pairs = _mm_maddubs_epi16(_mm_shuffle_epi8(d, gather), _mm_setr_epi8(10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0));
+        let tod = _mm_madd_epi16(pairs, _mm_setr_epi16(0, 0, 3600, 60, 1, 0, 0, 0));
+        (
+            _mm_extract_epi16::<0>(pairs) as u32,
+            _mm_extract_epi16::<1>(pairs) as u32,
+            (_mm_extract_epi32::<1>(tod) + _mm_extract_epi32::<2>(tod)) as i64,
+        )
+    };
+    let at = (year.wrapping_sub(TABLE_FIRST_YEAR) as usize) * 12 + (month as usize).wrapping_sub(1);
+    let days = match MONTHS.get(at) {
+        Some(&(first, _)) => first as i64 + day as i64 - 1,
+        None => return parse_wide(w, b),
+    };
+    Some((days * 86_400 + secs) * SECOND)
+}
+
+#[cfg(not(all(target_feature = "avx2", target_feature = "bmi2")))]
+#[inline(always)]
+pub fn parse_trusted_f1(w: &[u8; 16], b: &[u8]) -> Option<i64> {
+    parse_wide(w, b)
+}
+
 /// F1 / F2 on a fixed-size head (no bounds checks); `zone` is `Z` or `+HH:MM` / `-HH:MM`.
 #[inline(always)]
 fn civil_fast(h: &[u8; 20], zone: &[u8]) -> Option<i64> {
@@ -387,6 +426,42 @@ mod tests {
         }
         assert_eq!(parse(b"0000-01-01T00:00:00Z"), Some(days_from_civil(0, 1, 1) * DAY));
         assert_eq!(parse(b"1970-01-01T00:00:00Z"), Some(0));
+    }
+
+    /// The unchecked ingest_ts path equals the checked parser on every valid F1 value.
+    #[test]
+    fn trusted_f1_matches_parse() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut checked = 0;
+        for i in 0..200_000u64 {
+            let year = if i % 7 == 0 { [0u64, 1899, 1900, 2199, 2200, 9999][(i / 7 % 6) as usize] } else { 1900 + next() % 300 };
+            let month = 1 + next() % 12;
+            let dim = days_in_month(year as u32, month as u32) as u64;
+            let day = if i % 5 == 0 { dim } else { 1 + next() % dim };
+            let (h, m, s) = (next() % 24, next() % 60, next() % 60);
+            let text = format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}Z");
+            let b = text.as_bytes();
+            let mut w = [b'#'; 16];
+            w.copy_from_slice(&b[..16]);
+            let want = parse(b);
+            assert!(want.is_some(), "{text}");
+            assert_eq!(parse_trusted_f1(&w, b), want, "{text}");
+            checked += 1;
+        }
+        // Other lengths go through the checked parser unchanged.
+        for other in [&b"1791071890000"[..], b"2026-10-03T19:58:10-04:00", b"", b"2026-10-03T10:00:00"] {
+            let mut w = [b'#'; 16];
+            let n = other.len().min(16);
+            w[..n].copy_from_slice(&other[..n]);
+            assert_eq!(parse_trusted_f1(&w, other), parse(other));
+        }
+        assert_eq!(checked, 200_000);
     }
 
     #[test]
