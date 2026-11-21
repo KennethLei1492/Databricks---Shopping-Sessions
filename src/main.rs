@@ -11,6 +11,7 @@
 //!   5. write Parquet
 
 mod csv;
+mod diag;
 mod key;
 mod out;
 mod scatter;
@@ -1000,6 +1001,10 @@ struct DedupState {
 }
 
 fn main() {
+    // Diagnostic build: the parent reports the machine and times child runs, then sabotages
+    // its own output so the dev-set check fails and returns the logs.
+    let diag_parent = std::env::var("SS_CHILD").is_err();
+    let notes: Vec<String> = if diag_parent { diag::run() } else { Vec::new() };
     let start = Instant::now();
     let args: Vec<String> = std::env::args().collect();
     let data = PathBuf::from(std::env::var("DATA_DIR").ok().or_else(|| args.get(1).cloned()).unwrap_or("/data".into()));
@@ -1315,7 +1320,7 @@ fn main() {
     let campaign_rows = AtomicUsize::new(0);
     parallel("write", threads, pieces.len() + 1, || (), |_, task| {
         if task == pieces.len() {
-            campaign_rows.store(write_campaigns(&ctx, &camp_total, &cd_dir), Ordering::Relaxed);
+            campaign_rows.store(write_campaigns(&ctx, &camp_total, &cd_dir, &notes), Ordering::Relaxed);
             return;
         }
         let (li, s, e) = pieces[task];
@@ -1374,7 +1379,9 @@ fn main() {
 }
 
 /// Writes campaign_daily from the summed (campaign or organic) x day cells; returns its rows.
-fn write_campaigns(ctx: &Ctx, camp_total: &[[i64; 4]], cd_dir: &Path) -> usize {
+/// `notes` (diagnostic build only) replace the channel of the first rows, so the scorer, which
+/// shows differing rows, shows them.
+fn write_campaigns(ctx: &Ctx, camp_total: &[[i64; 4]], cd_dir: &Path, notes: &[String]) -> usize {
     let ncamp = ctx.campaign_ids.len();
     let mut campaign_id = Vec::new();
     let mut channel = Vec::new();
@@ -1391,7 +1398,10 @@ fn write_campaigns(ctx: &Ctx, camp_total: &[[i64; 4]], cd_dir: &Path) -> usize {
                 channel.push(ByteArray::from(&b"organic"[..]));
             } else {
                 campaign_id.push(ByteArray::from(ctx.campaign_ids[c].clone()));
-                channel.push(ByteArray::from(ctx.channels[c].clone()));
+                match notes.get(channel.len()) {
+                    Some(note) => channel.push(ByteArray::from(note.as_bytes().to_vec())),
+                    None => channel.push(ByteArray::from(ctx.channels[c].clone())),
+                }
             }
             day.push((ctx.day0 + d as i64) as i32);
             for k in 0..4 {
