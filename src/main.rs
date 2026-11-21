@@ -1255,7 +1255,9 @@ fn main() {
                     continue;
                 }
                 let cks = &mut cks[ck_at[b]..ck_at[b + 1]];
-                cks.sort_unstable_by_key(|c| (c.person, c.ts, c.cid));
+                // By (person, ts) only: process_person resolves equal-ts clicks to the smallest
+                // click_id itself, so their order does not matter. One u128 compare per step.
+                cks.sort_unstable_by_key(|c| (c.person as u128) << 32 | c.ts as u128);
                 let mut lows = std::mem::take(&mut agg.lows);
                 let first = (evs[0] >> 64) as u64;
                 if evs.iter().all(|&x| (x >> 64) as u64 == first) {
