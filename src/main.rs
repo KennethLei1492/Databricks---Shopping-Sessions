@@ -338,52 +338,65 @@ fn build_links(data: &Path, threads: usize) -> Persons {
         base[p + 1] = base[p] + parts[p].keys.len() as u32;
     }
     let n_ids = base[LINK_PARTS] as usize;
+    // Partitions own disjoint pair slots and disjoint id ranges, so they fill in parallel.
     let mut slot_id = vec![0u32; 2 * total];
-    let mut keys: Vec<Key> = Vec::with_capacity(n_ids);
-    for (p, part) in parts.iter().enumerate() {
-        for &(slot, local) in &part.assign {
-            slot_id[slot as usize] = base[p] + local;
-        }
-        keys.extend_from_slice(&part.keys);
+    let mut keys: Vec<Key> = vec![0; n_ids];
+    {
+        let slot_ptr = SyncPtr(slot_id.as_mut_ptr());
+        let key_ptr = SyncPtr(keys.as_mut_ptr());
+        parallel("links-fill", threads, LINK_PARTS, || (), |_, p| {
+            let part = &parts[p];
+            let b = base[p];
+            for &(slot, local) in &part.assign {
+                // SAFETY: each pair slot is assigned by exactly one partition; slot < 2 * total.
+                unsafe { *slot_ptr.get().add(slot as usize) = b + local };
+            }
+            // SAFETY: [base[p], base[p + 1]) is this partition's own range of ids.
+            unsafe { std::ptr::copy_nonoverlapping(part.keys.as_ptr(), key_ptr.get().add(b as usize), part.keys.len()) };
+        });
     }
     drop(parts);
+    let t_fill = t0.elapsed().as_secs_f64();
 
-    let mut parent: Vec<u32> = (0..n_ids as u32).collect();
-    let mut size: Vec<u32> = vec![1; n_ids];
+    // The only serial step: union by size with path halving; parent and size share a cache
+    // line, and each root keeps its component's byte-wise smallest key as it goes.
+    let mut node: Vec<[u32; 2]> = (0..n_ids as u32).map(|i| [i, 1]).collect();
+    let mut name: Vec<Key> = keys.clone();
     #[inline(always)]
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        while parent[x as usize] != x {
-            let up = parent[parent[x as usize] as usize];
-            parent[x as usize] = up;
+    fn find(node: &mut [[u32; 2]], mut x: u32) -> u32 {
+        while node[x as usize][0] != x {
+            let up = node[node[x as usize][0] as usize][0];
+            node[x as usize][0] = up;
             x = up;
         }
         x
     }
     for pair in slot_id.chunks_exact(2) {
-        let ra = find(&mut parent, pair[0]);
-        let rb = find(&mut parent, pair[1]);
+        let ra = find(&mut node, pair[0]);
+        let rb = find(&mut node, pair[1]);
         if ra != rb {
-            let (big, small) = if size[ra as usize] >= size[rb as usize] { (ra, rb) } else { (rb, ra) };
-            parent[small as usize] = big;
-            size[big as usize] += size[small as usize];
+            let (big, small) = if node[ra as usize][1] >= node[rb as usize][1] { (ra, rb) } else { (rb, ra) };
+            node[small as usize][0] = big;
+            node[big as usize][1] += node[small as usize][1];
+            if key::cmp(name[small as usize], name[big as usize]).is_lt() {
+                name[big as usize] = name[small as usize];
+            }
         }
     }
-    let mut root: Vec<u32> = vec![0; n_ids];
-    let mut name: Vec<Key> = keys.clone();
-    for i in 0..n_ids {
-        let r = find(&mut parent, i as u32);
-        root[i] = r;
-        if key::cmp(keys[i], name[r as usize]).is_lt() {
-            name[r as usize] = keys[i];
-        }
-    }
+    drop(slot_id);
     let t_union = t0.elapsed().as_secs_f64();
 
+    // Roots by read-only walks (trees are shallow after union by size), fused with building
+    // each partition's map from non-name IDs to names.
     let maps = parallel("links-names", threads, LINK_PARTS, Vec::new, |out: &mut Vec<(usize, KeyMap<Key>)>, p| {
         let (lo, hi) = (base[p] as usize, base[p + 1] as usize);
         let mut m: KeyMap<Key> = KeyMap::with_capacity(hi - lo);
         for id in lo..hi {
-            let nm = name[root[id] as usize];
+            let mut r = id as u32;
+            while node[r as usize][0] != r {
+                r = node[r as usize][0];
+            }
+            let nm = name[r as usize];
             if nm != keys[id] {
                 m.entry(keys[id], nm);
             }
@@ -398,11 +411,26 @@ fn build_links(data: &Path, threads: usize) -> Persons {
     }
     let persons = Persons { parts: slots.into_iter().map(|m| m.expect("partition map")).collect() };
     eprintln!(
-        "  links: {total} pairs, {n_ids} ids; ids {t_ids:.3}s, union-find {:.3}s, name maps {:.3}s",
-        t_union - t_ids,
+        "  links: {total} pairs, {n_ids} ids; ids {t_ids:.3}s, fill {:.3}s, union-find (serial) {:.3}s, name maps {:.3}s",
+        t_fill - t_ids,
+        t_union - t_fill,
         t0.elapsed().as_secs_f64() - t_union
     );
     persons
+}
+
+/// A raw pointer that worker threads may share, for writes to provably disjoint indices.
+#[derive(Clone, Copy)]
+struct SyncPtr<T>(*mut T);
+// SAFETY: used only for writes to disjoint indices (see the call sites).
+unsafe impl<T> Send for SyncPtr<T> {}
+unsafe impl<T> Sync for SyncPtr<T> {}
+
+impl<T> SyncPtr<T> {
+    #[inline(always)]
+    fn get(&self) -> *mut T {
+        self.0
+    }
 }
 
 fn load_context(data: &Path, start: Instant) -> Ctx {
@@ -413,10 +441,10 @@ fn load_context(data: &Path, start: Instant) -> Ctx {
 
     let products_raw = read_small(&data.join("products.csv"));
     let product_rows = two_columns(&products_raw);
-    let mut categories: Vec<Vec<u8>> = product_rows.iter().map(|r| r.1.to_vec()).collect();
-    categories.push(b"unknown".to_vec());
+    // Distinct categories through a set (few of them), not by sorting a copy of every row.
+    let distinct: std::collections::HashSet<&[u8]> = product_rows.iter().map(|r| r.1).chain([&b"unknown"[..]]).collect();
+    let mut categories: Vec<Vec<u8>> = distinct.into_iter().map(|c| c.to_vec()).collect();
     categories.sort();
-    categories.dedup();
     assert!(categories.len() <= 256, "more than 256 categories");
     let cat_index: HashMap<&[u8], u32> = categories.iter().enumerate().map(|(i, c)| (c.as_slice(), i as u32)).collect();
     let unknown = cat_index[&b"unknown"[..]];
@@ -744,24 +772,32 @@ fn main() {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from))
         .clamp(1, 256);
 
-    let ctx = load_context(&data, start);
+    // ---- links on the pool while one more thread loads the lookups and plans the input chunks
+    // (links need neither), then events (bucketed by event_id) and clicks
+    let ((ctx, events_in, clicks_in, ev_chunks, ck_chunks), persons) = std::thread::scope(|scope| {
+        let setup = scope.spawn(|| {
+            let ctx = load_context(&data, start);
+            let events_in = csv::Input::open(&csv::list_csv(&data.join("events")));
+            let clicks_in = csv::Input::open(&csv::list_csv(&data.join("clicks")));
+            let ev_chunks = events_in.chunks(chunk_size());
+            let ck_chunks = clicks_in.chunks(chunk_size());
+            (ctx, events_in, clicks_in, ev_chunks, ck_chunks)
+        });
+        let persons = build_links(&data, threads);
+        log(start, &format!("links: {} non-name IDs mapped", persons.len()));
+        (setup.join().expect("setup thread panicked"), persons)
+    });
+    log(start, "setup joined");
 
     if let Ok(mode) = std::env::var("SS_BENCH") {
         bench(&ctx, &data, &mode);
         return;
     }
 
-    // ---- links first (parallel, small), then events (bucketed by event_id) and clicks
-    let events_in = csv::Input::open(&csv::list_csv(&data.join("events")));
-    let clicks_in = csv::Input::open(&csv::list_csv(&data.join("clicks")));
-    let ev_chunks = events_in.chunks(chunk_size());
-    let ck_chunks = clicks_in.chunks(chunk_size());
     // Generous capacities: untouched capacity costs nothing, a doubling copy costs a lot.
     let ev_estimate = events_in.bytes() / 40 / NP / threads + 64;
     let ck_estimate = clicks_in.bytes() / 20 / threads + 64;
     let n_tasks = ev_chunks.len() + ck_chunks.len();
-    let persons = build_links(&data, threads);
-    log(start, &format!("links: {} non-name IDs mapped", persons.len()));
     let parsed = {
         let parsed = parallel(
             "parse",
@@ -955,14 +991,28 @@ fn main() {
         }
         row_lists.push(agg.rows);
     }
-    let row_lists: Vec<Mutex<Vec<UserRow>>> = row_lists.into_iter().map(Mutex::new).collect();
-    let written = AtomicUsize::new(0);
-    parallel("write", threads, row_lists.len(), || (), |_, t| {
-        let rows = std::mem::take(&mut *row_lists[t].lock().unwrap());
-        if rows.is_empty() && t != 0 {
+    // Small, even pieces (several per thread), so no single file sets the phase's length;
+    // campaign_daily is written as one more task alongside them.
+    let total_rows: usize = row_lists.iter().map(|r| r.len()).sum();
+    let piece_rows = (total_rows / (4 * threads)).max(4096);
+    let mut pieces: Vec<(usize, usize, usize)> = Vec::new();
+    for (li, list) in row_lists.iter().enumerate() {
+        for s in (0..list.len()).step_by(piece_rows) {
+            pieces.push((li, s, (s + piece_rows).min(list.len())));
+        }
+    }
+    if pieces.is_empty() {
+        pieces.push((0, 0, 0)); // user_daily still needs one (empty) file
+    }
+    let cat_bytes: Vec<bytes::Bytes> = ctx.categories.iter().map(|c| bytes::Bytes::from(c.clone())).collect();
+    let campaign_rows = AtomicUsize::new(0);
+    parallel("write", threads, pieces.len() + 1, || (), |_, task| {
+        if task == pieces.len() {
+            campaign_rows.store(write_campaigns(&ctx, &camp_total, &cd_dir), Ordering::Relaxed);
             return;
         }
-        written.fetch_add(rows.len(), Ordering::Relaxed);
+        let (li, s, e) = pieces[task];
+        let rows = &row_lists.get(li).map_or(&[][..], |l| &l[s..e]);
         let n = rows.len();
         let mut user_id = Vec::with_capacity(n);
         let mut day = Vec::with_capacity(n);
@@ -974,12 +1024,11 @@ fn main() {
         // All names in one buffer, sliced per row: no allocation per string.
         let mut names = Vec::with_capacity(n * 10);
         let mut ends = Vec::with_capacity(n);
-        for r in &rows {
+        for r in rows.iter() {
             key::append_bytes(r.person, &mut names);
             ends.push(names.len());
         }
         let names = bytes::Bytes::from(names);
-        let cat_bytes: Vec<bytes::Bytes> = ctx.categories.iter().map(|c| bytes::Bytes::from(c.clone())).collect();
         let mut from = 0;
         for (r, &end) in rows.iter().zip(&ends) {
             user_id.push(ByteArray::from(names.slice(from..end)));
@@ -996,7 +1045,7 @@ fn main() {
             }
         }
         out::write(
-            &ud_dir.join(format!("part-{t:05}.parquet")),
+            &ud_dir.join(format!("part-{task:05}.parquet")),
             out::USER_SCHEMA,
             vec![
                 out::Column::Bytes(user_id),
@@ -1009,7 +1058,17 @@ fn main() {
             n,
         );
     });
+    log(
+        start,
+        &format!("wrote {total_rows} user_daily rows, {} campaign_daily rows", campaign_rows.load(Ordering::Relaxed)),
+    );
+    // Skip freeing gigabytes of buckets one by one: the process is done.
+    std::process::exit(0);
+}
 
+/// Writes campaign_daily from the summed (campaign or organic) x day cells; returns its rows.
+fn write_campaigns(ctx: &Ctx, camp_total: &[[i64; 4]], cd_dir: &Path) -> usize {
+    let ncamp = ctx.campaign_ids.len();
     let mut campaign_id = Vec::new();
     let mut channel = Vec::new();
     let mut day = Vec::new();
@@ -1049,7 +1108,5 @@ fn main() {
         ],
         n,
     );
-    log(start, &format!("wrote {} user_daily rows, {n} campaign_daily rows", written.load(Ordering::Relaxed)));
-    // Skip freeing gigabytes of buckets one by one: the process is done.
-    std::process::exit(0);
+    n
 }
