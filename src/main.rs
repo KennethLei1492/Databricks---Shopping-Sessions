@@ -13,6 +13,7 @@
 mod csv;
 mod key;
 mod out;
+mod scatter;
 mod ts;
 
 use key::{pack, Key, KeyMap};
@@ -33,7 +34,9 @@ const GAP: i64 = 1_800_000;
 const SEVEN_DAYS: i64 = 7 * DAY;
 const NP: usize = 512; // event-id buckets
 const NQ: usize = 512; // person buckets
-const CHUNK: usize = 4 << 20;
+// L2-sized read chunks: the buffer is still in cache when the parser reads it, instead of
+// making a round trip through memory between pread and parsing.
+const CHUNK: usize = 256 << 10;
 const INVALID: u32 = u32::MAX;
 const NONE: u32 = u32::MAX;
 const NO_CATEGORY: u16 = u16::MAX;
@@ -46,13 +49,15 @@ fn chunk_size() -> usize {
 
 /// A parsed event copy. `ts == INVALID` marks a copy that fails validation (it still competes in
 /// dedup). `pc` is `price << 8 | category` for a purchase, else 0.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
 struct EvRec {
     eid: Key,
     user: Key,
     ingest: u32, // seconds, offset so that ordering is preserved
     ts: u32,     // ms since window_start
     pc: u32,
+    _pad: u32, // explicit, so whole-record SIMD copies read no uninitialized bytes
 }
 
 /// A valid click. `person` holds the user ID until links are known. `ts` is ms since
@@ -507,7 +512,7 @@ fn parse_event(ctx: &Ctx, r: &csv::Rec<'_, 7>) -> Option<EvRec> {
         Some(ms) => (ms.div_euclid(1000) - ctx.ingest_base_s).clamp(0, u32::MAX as i64 - 1) as u32,
         None => u32::MAX,
     };
-    let mut rec = EvRec { eid: key::pack_wide(r.wide(0), f[0]), user: 0, ingest, ts: INVALID, pc: 0 };
+    let mut rec = EvRec { eid: key::pack_wide(r.wide(0), f[0]), user: 0, ingest, ts: INVALID, pc: 0, _pad: 0 };
     let purchase = match f[4] {
         b"view" | b"cart" => false,
         b"purchase" => true,
@@ -557,9 +562,44 @@ struct UserRow {
 struct Agg {
     rows: Vec<UserRow>,
     camp: Vec<[i64; 4]>, // (campaign or organic) x day: sessions, purchasing, revenue, assisted
-    stamp: Vec<u32>,
-    serial: u32,
+    // The click window [start - 7 days, start] as counts per campaign plus the list of campaigns
+    // with a non-zero count, so a session's assists cost its distinct campaigns, not its clicks.
+    count: Vec<u32>,
+    active: Vec<u32>,
+    pos: Vec<u32>,
     catsum: Vec<i64>,
+}
+
+impl Agg {
+    #[inline(always)]
+    fn enter(&mut self, camp: u32) {
+        let c = camp as usize;
+        if self.count[c] == 0 {
+            self.pos[c] = self.active.len() as u32;
+            self.active.push(camp);
+        }
+        self.count[c] += 1;
+    }
+
+    #[inline(always)]
+    fn leave(&mut self, camp: u32) {
+        let c = camp as usize;
+        self.count[c] -= 1;
+        if self.count[c] == 0 {
+            let at = self.pos[c] as usize;
+            let last = *self.active.last().unwrap();
+            self.active[at] = last;
+            self.pos[last as usize] = at as u32;
+            self.active.pop();
+        }
+    }
+
+    fn clear_window(&mut self) {
+        for &c in &self.active {
+            self.count[c as usize] = 0;
+        }
+        self.active.clear();
+    }
 }
 
 fn flush_day(agg: &mut Agg, person: Key, day: i64, sessions: i64, events: i64, revenue: i64) {
@@ -622,9 +662,11 @@ fn process_person(ctx: &Ctx, agg: &mut Agg, person: Key, evs: &[u128], clicks: &
         let hi = start - ctx.click_base;
         let lo = hi - SEVEN_DAYS;
         while r < clicks.len() && clicks[r].ts as i64 <= hi {
+            agg.enter(clicks[r].camp);
             r += 1;
         }
         while l < r && (clicks[l].ts as i64) < lo {
+            agg.leave(clicks[l].camp);
             l += 1;
         }
         let di = (day - ctx.day0) as usize;
@@ -647,19 +689,13 @@ fn process_person(ctx: &Ctx, agg: &mut Agg, person: Key, evs: &[u128], clicks: &
         cell[0] += 1;
         cell[1] += purchased as i64;
         cell[2] += revenue;
-        if l < r {
-            agg.serial += 1;
-            let serial = agg.serial;
-            for c in &clicks[l..r] {
-                let camp = c.camp as usize;
-                if agg.stamp[camp] != serial {
-                    agg.stamp[camp] = serial;
-                    agg.camp[camp * ndays + di][3] += 1;
-                }
-            }
+        // Every campaign with a click in the window assists once.
+        for &c in &agg.active {
+            agg.camp[c as usize * ndays + di][3] += 1;
         }
         s = e;
     }
+    agg.clear_window();
     if cur_day != i64::MIN {
         flush_day(agg, person, cur_day, d_sessions, d_events, d_revenue);
     }
@@ -675,12 +711,29 @@ fn take_all<T>(slot: &Mutex<Vec<Vec<T>>>) -> Vec<T> {
     all
 }
 
+/// A bucket of records: a Vec or a write-combined line bucket.
+trait Bucket {
+    fn count(&self) -> usize;
+}
+
+impl<T> Bucket for Vec<T> {
+    fn count(&self) -> usize {
+        self.len()
+    }
+}
+
+impl<T: Copy, const K: usize> Bucket for scatter::Lines<T, K> {
+    fn count(&self) -> usize {
+        self.len()
+    }
+}
+
 /// Moves per-thread bucket lists into per-bucket slots: slots[b] holds every thread's bucket b.
-fn regroup<T>(per_thread: Vec<Vec<Vec<T>>>, n: usize) -> Vec<Mutex<Vec<Vec<T>>>> {
-    let mut slots: Vec<Vec<Vec<T>>> = (0..n).map(|_| Vec::with_capacity(per_thread.len())).collect();
+fn regroup<B: Bucket>(per_thread: Vec<Vec<B>>, n: usize) -> Vec<Mutex<Vec<B>>> {
+    let mut slots: Vec<Vec<B>> = (0..n).map(|_| Vec::with_capacity(per_thread.len())).collect();
     for buckets in per_thread {
         for (b, v) in buckets.into_iter().enumerate() {
-            if !v.is_empty() {
+            if v.count() > 0 {
                 slots[b].push(v);
             }
         }
@@ -690,10 +743,10 @@ fn regroup<T>(per_thread: Vec<Vec<Vec<T>>>, n: usize) -> Vec<Mutex<Vec<Vec<T>>>>
 
 /// Counting-sort scatter of several pieces into `nb` bins: returns the binned records and the
 /// start of each bin (nb + 1 offsets). Reads each piece in place, so no concatenation copy.
-fn bin_scatter<T: Copy>(pieces: &[Vec<T>], nb: usize, bin: impl Fn(&T) -> usize) -> (Vec<T>, Vec<usize>) {
+fn bin_scatter<T: Copy>(pieces: &[&[T]], nb: usize, bin: impl Fn(&T) -> usize) -> (Vec<T>, Vec<usize>) {
     let mut at = vec![0usize; nb + 1];
     for piece in pieces {
-        for x in piece {
+        for x in piece.iter() {
             at[bin(x) + 1] += 1;
         }
     }
@@ -706,7 +759,7 @@ fn bin_scatter<T: Copy>(pieces: &[Vec<T>], nb: usize, bin: impl Fn(&T) -> usize)
     let spare = out.spare_capacity_mut();
     let mut next = at.clone();
     for piece in pieces {
-        for x in piece {
+        for x in piece.iter() {
             let b = bin(x);
             spare[next[b]].write(*x);
             next[b] += 1;
@@ -717,8 +770,8 @@ fn bin_scatter<T: Copy>(pieces: &[Vec<T>], nb: usize, bin: impl Fn(&T) -> usize)
     (out, at)
 }
 
-fn slot_len<T>(slot: &Mutex<Vec<Vec<T>>>) -> usize {
-    slot.lock().unwrap().iter().map(|p| p.len()).sum()
+fn slot_len<B: Bucket>(slot: &Mutex<Vec<B>>) -> usize {
+    slot.lock().unwrap().iter().map(|p| p.count()).sum()
 }
 
 /// Single-threaded micro-benchmarks of the event parse path (SS_BENCH=lines|split|event|push).
@@ -751,14 +804,17 @@ fn bench(ctx: &Ctx, data: &Path, mode: &str) {
 
 struct ParseState {
     buf: Vec<u8>,
-    events: Vec<Vec<EvRec>>,
+    events: scatter::Scatter<EvRec, 2>,
     clicks: Vec<ClickRec>,
 }
 
 struct RegroupState {
-    sess: Vec<Vec<u128>>,
+    sess: scatter::Scatter<u128, 4>,
     clicks: Vec<Vec<ClickRec>>,
-    users: Vec<(Key, u32, u32)>,
+    tab_keys: Vec<Key>,
+    tab_vals: Vec<u32>,
+    used: Vec<u32>,
+    win: Vec<u64>,
 }
 
 fn main() {
@@ -805,7 +861,7 @@ fn main() {
             n_tasks,
             || ParseState {
                 buf: Vec::new(),
-                events: (0..NP).map(|_| Vec::<EvRec>::with_capacity(ev_estimate)).collect(),
+                events: scatter::Scatter::new(NP, ev_estimate),
                 clicks: Vec::with_capacity(ck_estimate),
             },
             |st, task| {
@@ -813,7 +869,7 @@ fn main() {
                 if task < ev_chunks.len() {
                     events_in.records::<7>(ev_chunks[task], buf, |f| {
                         if let Some(rec) = parse_event(&ctx, f) {
-                            events[bucket(rec.eid, NP)].push(rec);
+                            events.push(bucket(rec.eid, NP), rec);
                         }
                     });
                 } else {
@@ -831,7 +887,7 @@ fn main() {
     let mut ev_threads = Vec::with_capacity(parsed.len());
     let mut ck_lists = Vec::with_capacity(parsed.len());
     for st in parsed {
-        ev_threads.push(st.events);
+        ev_threads.push(st.events.finish());
         ck_lists.push(st.clicks);
     }
     let ev_slots = regroup(ev_threads, NP);
@@ -853,9 +909,12 @@ fn main() {
         threads,
         n_lists + NP,
         || RegroupState {
-            sess: (0..NQ).map(|_| Vec::with_capacity(sess_estimate)).collect(),
+            sess: scatter::Scatter::new(NQ, sess_estimate),
             clicks: (0..NQ).map(|_| Vec::with_capacity(ck_bucket_estimate)).collect(),
-            users: Vec::new(),
+            tab_keys: Vec::new(),
+            tab_vals: Vec::new(),
+            used: Vec::new(),
+            win: Vec::new(),
         },
         |st, task| {
             if task < n_lists {
@@ -873,34 +932,76 @@ fn main() {
                 return;
             }
             // Index each thread's piece in place (piece << 24 | position).
-            let pieces = std::mem::take(&mut *ev_slots[task - n_lists].lock().unwrap());
+            let owned = std::mem::take(&mut *ev_slots[task - n_lists].lock().unwrap());
+            let pieces: Vec<&[EvRec]> = owned.iter().map(|p| p.as_slice()).collect();
             let n: usize = pieces.iter().map(|p| p.len()).sum();
             let at = |v: u32| &pieces[(v >> 24) as usize][(v & 0xFF_FFFF) as usize];
-            let mut map: KeyMap<u32> = KeyMap::with_capacity(n);
+            let mut offsets = Vec::with_capacity(pieces.len());
+            let mut total = 0usize;
+            for p in &pieces {
+                offsets.push(total);
+                total += p.len();
+            }
+            let flat = |v: u32| offsets[(v >> 24) as usize] + (v & 0xFF_FFFF) as usize;
+            // A reused open-addressing table (never zero-filled: only the used slots are reset),
+            // and a bit per record that is set while the record is its event_id's kept copy.
+            let cap = (2 * n).next_power_of_two().max(1024);
+            if st.tab_keys.len() < cap {
+                st.tab_keys.resize(cap, key::EMPTY);
+                st.tab_vals.resize(cap, 0);
+            }
+            let mask = cap - 1;
+            st.win.clear();
+            st.win.resize(n / 64 + 1, 0);
             for (pi, piece) in pieces.iter().enumerate() {
                 assert!(pi < 256 && piece.len() < 1 << 24, "bucket piece too large to index");
+                let base = offsets[pi];
                 for (i, r) in piece.iter().enumerate() {
                     let v = (pi as u32) << 24 | i as u32;
-                    let (slot, present) = map.entry(r.eid, v);
-                    if present && r.ingest < at(*slot).ingest {
-                        *slot = v;
+                    let mut slot = key::hash(r.eid) as usize & mask;
+                    loop {
+                        let k = st.tab_keys[slot];
+                        if k == key::EMPTY {
+                            st.tab_keys[slot] = r.eid;
+                            st.tab_vals[slot] = v;
+                            st.used.push(slot as u32);
+                            let g = base + i;
+                            st.win[g / 64] |= 1 << (g % 64);
+                            break;
+                        }
+                        if k == r.eid {
+                            let w = st.tab_vals[slot];
+                            if r.ingest < at(w).ingest {
+                                let old = flat(w);
+                                st.win[old / 64] &= !(1 << (old % 64));
+                                let g = base + i;
+                                st.win[g / 64] |= 1 << (g % 64);
+                                st.tab_vals[slot] = v;
+                            }
+                            break;
+                        }
+                        slot = (slot + 1) & mask;
                     }
                 }
             }
-            st.users.clear();
-            for (_, v) in map.iter() {
-                let r = at(v);
-                if r.ts != INVALID {
-                    st.users.push((r.user, r.ts, r.pc));
-                }
+            for &slot in &st.used {
+                st.tab_keys[slot as usize] = key::EMPTY;
             }
-            for i in 0..st.users.len() {
-                if let Some(next) = st.users.get(i + PREFETCH) {
-                    persons.prefetch(next.0);
+            st.used.clear();
+            // Emit kept, valid copies in record order, with person lookups prefetched ahead.
+            for (pi, piece) in pieces.iter().enumerate() {
+                let base = offsets[pi];
+                for (i, r) in piece.iter().enumerate() {
+                    if let Some(next) = piece.get(i + PREFETCH) {
+                        persons.prefetch(next.user);
+                    }
+                    let g = base + i;
+                    if st.win[g / 64] >> (g % 64) & 1 == 0 || r.ts == INVALID {
+                        continue;
+                    }
+                    let person = persons.get(r.user);
+                    st.sess.push(bucket(person, NQ), (person as u128) << 64 | (r.ts as u128) << 32 | r.pc as u128);
                 }
-                let (user, ts, pc) = st.users[i];
-                let person = persons.get(user);
-                st.sess[bucket(person, NQ)].push((person as u128) << 64 | (ts as u128) << 32 | pc as u128);
             }
         },
     );
@@ -908,7 +1009,7 @@ fn main() {
     let mut sess_threads = Vec::with_capacity(regrouped.len());
     let mut ck_threads = Vec::with_capacity(regrouped.len());
     for st in regrouped {
-        sess_threads.push(st.sess);
+        sess_threads.push(st.sess.finish());
         ck_threads.push(st.clicks);
     }
     let sess_slots = regroup(sess_threads, NQ);
@@ -927,8 +1028,9 @@ fn main() {
         || Agg {
             rows: Vec::new(),
             camp: vec![[0; 4]; (ncamp + 1) * ctx.ndays],
-            stamp: vec![0; ncamp + 1],
-            serial: 0,
+            count: vec![0; ncamp + 1],
+            active: Vec::new(),
+            pos: vec![0; ncamp + 1],
             catsum: vec![0; ctx.categories.len()],
         },
         |agg, task| {
@@ -940,8 +1042,12 @@ fn main() {
             // clicks share a bin, and a bin holds only a few persons, so sorting it is cheap.
             let nb = (n_ev / 8).next_power_of_two().clamp(16, 1 << 16);
             let bin = |p: Key| ((key::hash(p) >> 16) as usize) & (nb - 1);
-            let (mut evs, ev_at) = bin_scatter(&ev_pieces, nb, |x: &u128| bin((x >> 64) as u64));
-            let (mut cks, ck_at) = bin_scatter(&ck_pieces, nb, |c: &ClickRec| bin(c.person));
+            let ev_slices: Vec<&[u128]> = ev_pieces.iter().map(|p| p.as_slice()).collect();
+            let ck_slices: Vec<&[ClickRec]> = ck_pieces.iter().map(|p| p.as_slice()).collect();
+            let (mut evs, ev_at) = bin_scatter(&ev_slices, nb, |x: &u128| bin((x >> 64) as u64));
+            let (mut cks, ck_at) = bin_scatter(&ck_slices, nb, |c: &ClickRec| bin(c.person));
+            drop(ev_slices);
+            drop(ck_slices);
             drop(ev_pieces);
             drop(ck_pieces);
             for b in 0..nb {

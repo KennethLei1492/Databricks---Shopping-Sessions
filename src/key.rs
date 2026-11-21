@@ -287,10 +287,6 @@ impl<V: Copy + Default> KeyMap<V> {
     pub fn len(&self) -> usize {
         self.len
     }
-
-    pub fn iter(&self) -> impl Iterator<Item = (Key, V)> + '_ {
-        self.keys.iter().zip(self.vals.iter()).filter(|(k, _)| **k != EMPTY).map(|(k, v)| (*k, *v))
-    }
 }
 
 #[cfg(test)]
