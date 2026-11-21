@@ -23,6 +23,11 @@ use std::sync::Mutex;
 use std::time::Instant;
 use ts::DAY;
 
+// mimalloc keeps freed memory for reuse instead of returning large blocks to the OS (glibc
+// munmap/mmap churn costs page faults and serializes threads on the mmap lock).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const GAP: i64 = 1_800_000;
 const SEVEN_DAYS: i64 = 7 * DAY;
 const NP: usize = 512; // event-id buckets
@@ -160,18 +165,19 @@ fn build_links(data: &Path) -> KeyMap<Key> {
     let mut buf = Vec::new();
     let mut pairs: Vec<(Key, Key)> = Vec::with_capacity(input.bytes() / 20);
     for chunk in input.chunks(chunk_size()) {
-        input.lines(chunk, &mut buf, |line| {
-            if let Some([a, b]) = csv::split::<2>(line) {
-                if !a.is_empty() && !b.is_empty() {
-                    pairs.push((pack(a), pack(b)));
-                }
+        input.records::<2>(chunk, &mut buf, |&[a, b]| {
+            if !a.is_empty() && !b.is_empty() {
+                pairs.push((pack(a), pack(b)));
             }
         });
     }
     let total = pairs.len();
-    let mut ids: KeyMap<u32> = KeyMap::with_capacity(total * 2);
-    let mut keys: Vec<Key> = Vec::with_capacity(total * 2);
-    let mut parent: Vec<u32> = Vec::with_capacity(total * 2);
+    let t_union = Instant::now();
+    // A person's k IDs need at least k-1 links, so distinct IDs are rarely far above the pair
+    // count; the map grows if they are.
+    let mut ids: KeyMap<u32> = KeyMap::with_capacity(total + total / 4);
+    let mut keys: Vec<Key> = Vec::with_capacity(total + total / 4);
+    let mut parent: Vec<u32> = Vec::with_capacity(total + total / 4);
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
         while parent[x as usize] != x {
             let up = parent[parent[x as usize] as usize];
@@ -205,6 +211,7 @@ fn build_links(data: &Path) -> KeyMap<Key> {
             }
         }
     }
+    eprintln!("links: {total} pairs, {} ids, union-find {:.3}s", keys.len(), t_union.elapsed().as_secs_f64());
     let mut persons: KeyMap<Key> = KeyMap::with_capacity(keys.len());
     for i in 0..keys.len() {
         let root = find(&mut parent, i as u32) as usize;
@@ -285,8 +292,7 @@ fn parse_price(b: &[u8]) -> Option<u32> {
 }
 
 #[inline]
-fn parse_event(ctx: &Ctx, line: &[u8]) -> Option<EvRec> {
-    let f = csv::split::<7>(line)?;
+fn parse_event(ctx: &Ctx, f: &[&[u8]; 7]) -> Option<EvRec> {
     if f[0].is_empty() {
         return None;
     }
@@ -317,8 +323,7 @@ fn parse_event(ctx: &Ctx, line: &[u8]) -> Option<EvRec> {
 }
 
 #[inline]
-fn parse_click(ctx: &Ctx, line: &[u8]) -> Option<ClickRec> {
-    let f = csv::split::<4>(line)?;
+fn parse_click(ctx: &Ctx, f: &[&[u8]; 4]) -> Option<ClickRec> {
     if f[0].is_empty() || f[1].is_empty() {
         return None;
     }
@@ -468,12 +473,15 @@ fn bench(ctx: &Ctx, data: &Path, mode: &str) {
     let mut buf = Vec::new();
     let mut buckets: Vec<Vec<EvRec>> = (0..NP).map(|_| Vec::new()).collect();
     for &c in &chunks {
-        input.lines(c, &mut buf, |line| match mode {
-            "lines" => n += line.len() as u64,
-            "split" => n += csv::split::<7>(line).is_some() as u64,
-            "event" => n += parse_event(ctx, line).is_some() as u64,
+        if mode == "lines" {
+            input.lines(c, &mut buf, |line| n += line.len() as u64);
+            continue;
+        }
+        input.records::<7>(c, &mut buf, |f| match mode {
+            "split" => n += 1,
+            "event" => n += parse_event(ctx, f).is_some() as u64,
             _ => {
-                if let Some(rec) = parse_event(ctx, line) {
+                if let Some(rec) = parse_event(ctx, f) {
                     buckets[bucket(join(rec.eid), NP)].push(rec);
                     n += 1;
                 }
@@ -499,7 +507,7 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from))
-        .max(1);
+        .clamp(1, 256);
 
     let ctx = load_context(&data, start);
 
@@ -533,14 +541,14 @@ fn main() {
             |st, task| {
                 let ParseState { buf, events, clicks } = st;
                 if task < ev_chunks.len() {
-                    events_in.lines(ev_chunks[task], buf, |line| {
-                        if let Some(rec) = parse_event(&ctx, line) {
+                    events_in.records::<7>(ev_chunks[task], buf, |f| {
+                        if let Some(rec) = parse_event(&ctx, f) {
                             events[bucket(join(rec.eid), NP)].push(rec);
                         }
                     });
                 } else {
-                    clicks_in.lines(ck_chunks[task - ev_chunks.len()], buf, |line| {
-                        if let Some(rec) = parse_click(&ctx, line) {
+                    clicks_in.records::<4>(ck_chunks[task - ev_chunks.len()], buf, |f| {
+                        if let Some(rec) = parse_click(&ctx, f) {
                             clicks.push(rec);
                         }
                     });
@@ -561,10 +569,17 @@ fn main() {
     // ---- dedup events on event_id, keep valid kept copies; map users to persons; bucket by person
     let person_of = |user: Key| persons.get(user).unwrap_or(user);
     let n_lists = ck_lists.len();
+    let sess_estimate = events_in.bytes() / 85 / NQ / threads + 16;
+    let ck_bucket_estimate = clicks_in.bytes() / 40 / NQ / threads + 16;
     let regrouped = parallel(
         threads,
         NP + n_lists,
-        || ((0..NQ).map(|_| Vec::<SessRec>::new()).collect::<Vec<_>>(), (0..NQ).map(|_| Vec::<ClickRec>::new()).collect::<Vec<_>>()),
+        || {
+            (
+                (0..NQ).map(|_| Vec::<SessRec>::with_capacity(sess_estimate)).collect::<Vec<_>>(),
+                (0..NQ).map(|_| Vec::<ClickRec>::with_capacity(ck_bucket_estimate)).collect::<Vec<_>>(),
+            )
+        },
         |(out, ck_out), task| {
             if task >= NP {
                 let list = std::mem::take(&mut *ck_lists[task - NP].lock().unwrap());
@@ -575,16 +590,24 @@ fn main() {
                 }
                 return;
             }
-            let recs = take_all(&ev_slots[task]);
-            let mut map: KeyMap<u32> = KeyMap::with_capacity(recs.len());
-            for (i, r) in recs.iter().enumerate() {
-                let (slot, present) = map.entry(join(r.eid), i as u32);
-                if present && r.ingest < recs[*slot as usize].ingest {
-                    *slot = i as u32;
+            // Index each thread's piece in place (piece << 24 | position) instead of copying
+            // the pieces into one vector first.
+            let pieces = std::mem::take(&mut *ev_slots[task].lock().unwrap());
+            let n: usize = pieces.iter().map(|p| p.len()).sum();
+            let at = |v: u32| &pieces[(v >> 24) as usize][(v & 0xFF_FFFF) as usize];
+            let mut map: KeyMap<u32> = KeyMap::with_capacity(n);
+            for (pi, piece) in pieces.iter().enumerate() {
+                assert!(pi < 256 && piece.len() < 1 << 24, "bucket piece too large to index");
+                for (i, r) in piece.iter().enumerate() {
+                    let v = (pi as u32) << 24 | i as u32;
+                    let (slot, present) = map.entry(join(r.eid), v);
+                    if present && r.ingest < at(*slot).ingest {
+                        *slot = v;
+                    }
                 }
             }
-            for (_, i) in map.iter() {
-                let r = &recs[i as usize];
+            for (_, v) in map.iter() {
+                let r = at(v);
                 if r.kind != 0 {
                     let person = person_of(join(r.user));
                     out[bucket(person, NQ)].push(SessRec { person: split(person), ts: r.ts, price: r.price, cat: r.cat, kind: r.kind });

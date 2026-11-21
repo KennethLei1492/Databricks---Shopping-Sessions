@@ -112,6 +112,150 @@ impl Input {
             f(&data[at..]);
         }
     }
+
+    /// Calls `f` with the unquoted fields of every well-formed N-field line of the chunk, skipping
+    /// the file's header line. Same results as `lines` + `split`, in one SIMD pass.
+    #[inline]
+    pub fn records<const N: usize>(&self, chunk: Chunk, buf: &mut Vec<u8>, mut f: impl FnMut(&[&[u8]; N])) {
+        let len = chunk.end - chunk.start;
+        if buf.len() < len {
+            buf.resize(len, 0);
+        }
+        self.files[chunk.file].read_exact_at(&mut buf[..len], chunk.start as u64).expect("read");
+        let data = &buf[..len];
+        let mut at = 0;
+        if chunk.start == 0 {
+            match memchr(NL, data) {
+                Some(nl) => at = nl + 1,
+                None => return,
+            }
+        }
+        parse_records::<N>(data, at, &mut f);
+    }
+}
+
+/// Bitmasks of newline, comma and quote bytes in 64 bytes.
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+fn masks(block: &[u8; 64]) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    // SAFETY: the binary is compiled with AVX2 enabled (cfg above); loads are unaligned-safe.
+    unsafe {
+        let a = _mm256_loadu_si256(block.as_ptr() as *const __m256i);
+        let b = _mm256_loadu_si256(block.as_ptr().add(32) as *const __m256i);
+        let eq = |c: u8| -> u64 {
+            let c = _mm256_set1_epi8(c as i8);
+            let lo = _mm256_movemask_epi8(_mm256_cmpeq_epi8(a, c)) as u32 as u64;
+            let hi = _mm256_movemask_epi8(_mm256_cmpeq_epi8(b, c)) as u32 as u64;
+            lo | hi << 32
+        };
+        (eq(NL), eq(b','), eq(b'"'))
+    }
+}
+
+#[cfg(not(target_feature = "avx2"))]
+#[inline(always)]
+fn masks(block: &[u8; 64]) -> (u64, u64, u64) {
+    let (mut nl, mut comma, mut quote) = (0u64, 0u64, 0u64);
+    for (i, &c) in block.iter().enumerate() {
+        nl |= ((c == NL) as u64) << i;
+        comma |= ((c == b',') as u64) << i;
+        quote |= ((c == b'"') as u64) << i;
+    }
+    (nl, comma, quote)
+}
+
+/// Splits `data[start..]` into lines and fields with one bitmask pass. A line is well-formed when
+/// it has exactly N-1 commas and every quote is the first or last byte of a field that starts and
+/// ends with one (length >= 2): then the line's quote count is exactly 2 per quoted field.
+pub fn parse_records<const N: usize>(data: &[u8], start: usize, f: &mut impl FnMut(&[&[u8]; N])) {
+    const { assert!(N >= 2 && N <= 16) };
+    let len = data.len();
+    let mut cuts = [0usize; 16];
+    let mut commas = 0usize;
+    let mut line_start = start;
+    let mut quotes_before = 0u32; // quote bytes of the current line in earlier blocks
+    let mut block_at = start;
+    let mut tail = [0u8; 64];
+    while block_at < len {
+        let block: &[u8; 64] = if block_at + 64 <= len {
+            data[block_at..block_at + 64].try_into().unwrap()
+        } else {
+            tail.fill(0);
+            tail[..len - block_at].copy_from_slice(&data[block_at..]);
+            &tail
+        };
+        let (nl, comma, quote) = masks(block);
+        let mut seps = nl | comma;
+        let mut quotes_left = quote;
+        while seps != 0 {
+            let b = seps.trailing_zeros();
+            seps &= seps - 1;
+            let bit = 1u64 << b;
+            let pos = block_at + b as usize;
+            if comma & bit != 0 {
+                if commas < N - 1 {
+                    cuts[commas] = pos;
+                }
+                commas += 1;
+            } else {
+                let below = bit - 1;
+                let q = quotes_before + (quotes_left & below).count_ones();
+                quotes_left &= !(below | bit);
+                quotes_before = 0;
+                emit::<N>(data, line_start, pos, &cuts, commas, q, f);
+                commas = 0;
+                line_start = pos + 1;
+            }
+        }
+        quotes_before += quotes_left.count_ones();
+        block_at += 64;
+    }
+    // A last line without its newline is still a line.
+    if line_start < len {
+        emit::<N>(data, line_start, len, &cuts, commas, quotes_before, f);
+    }
+}
+
+#[inline(always)]
+fn emit<const N: usize>(
+    data: &[u8],
+    line_start: usize,
+    line_end: usize,
+    cuts: &[usize; 16],
+    commas: usize,
+    quotes: u32,
+    f: &mut impl FnMut(&[&[u8]; N]),
+) {
+    if commas != N - 1 {
+        return; // wrong field count; an empty line has 0 commas
+    }
+    let mut fields: [&[u8]; N] = [&[]; N];
+    let mut s = line_start;
+    for (i, field) in fields.iter_mut().enumerate() {
+        let e = if i < N - 1 { cuts[i] } else { line_end };
+        *field = &data[s..e];
+        s = e + 1;
+    }
+    if quotes != 0 {
+        let mut stripped = 0u32;
+        for field in fields.iter_mut() {
+            let n = field.len();
+            let first = n > 0 && field[0] == b'"';
+            let last = n > 0 && field[n - 1] == b'"';
+            if first || last {
+                if !(first && last && n >= 2) {
+                    return;
+                }
+                *field = &field[1..n - 1];
+                stripped += 2;
+            }
+        }
+        if stripped != quotes {
+            return; // a quote inside a field
+        }
+    }
+    f(&fields);
 }
 
 /// Splits a line into exactly N fields and strips whole-field quotes; None if malformed.
@@ -163,5 +307,47 @@ mod tests {
         assert_eq!(split::<2>(b"a,\"b\"c\""), None);
         assert_eq!(split::<2>(b"a,b\"c"), None);
         assert_eq!(split::<2>(b",u3"), Some([&b""[..], b"u3"]));
+    }
+
+    /// The SIMD splitter must agree with the simple line + split path on random dirty input.
+    fn check_agrees<const N: usize>(seed: u64) {
+        let alphabet = b"ab,,\"\"\n \r1";
+        let mut x = seed | 1;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..2_000 {
+            let len = (next() % 400) as usize;
+            let data: Vec<u8> = (0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
+            let start = (next() % (len as u64 + 1)) as usize;
+            let mut expected: Vec<Vec<Vec<u8>>> = Vec::new();
+            let body = &data[start..];
+            let mut lines: Vec<&[u8]> = body.split(|&c| c == NL).collect();
+            if body.ends_with(b"\n") || body.is_empty() {
+                lines.pop();
+            }
+            for line in lines {
+                if let Some(fields) = split::<N>(line) {
+                    expected.push(fields.iter().map(|f| f.to_vec()).collect());
+                }
+            }
+            let mut actual: Vec<Vec<Vec<u8>>> = Vec::new();
+            parse_records::<N>(&data, start, &mut |fields: &[&[u8]; N]| {
+                actual.push(fields.iter().map(|f| f.to_vec()).collect())
+            });
+            assert_eq!(actual, expected, "data {:?} start {start}", String::from_utf8_lossy(&data));
+        }
+    }
+
+    #[test]
+    fn simd_splitter_matches_simple_split() {
+        for seed in 1..40 {
+            check_agrees::<2>(seed);
+            check_agrees::<4>(seed * 7919);
+            check_agrees::<7>(seed * 104_729);
+        }
     }
 }

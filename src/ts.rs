@@ -3,12 +3,35 @@
 pub const SECOND: i64 = 1_000;
 pub const DAY: i64 = 86_400_000;
 
-pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+pub const fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let year = if month <= 2 { year - 1 } else { year };
     let era = year.div_euclid(400);
     let year_of_era = year - era * 400;
     let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
     era * 146_097 + year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year - 719_468
+}
+
+const TABLE_FIRST_YEAR: u32 = 1900;
+const TABLE_YEARS: usize = 300;
+
+/// Days since the epoch of the first of each month, 1900-01 to 2199-12 (built at compile time).
+static MONTH_START: [i32; TABLE_YEARS * 12] = {
+    let mut t = [0i32; TABLE_YEARS * 12];
+    let mut i = 0;
+    while i < TABLE_YEARS * 12 {
+        t[i] = days_from_civil(TABLE_FIRST_YEAR as i64 + (i / 12) as i64, (i % 12) as i64 + 1, 1) as i32;
+        i += 1;
+    }
+    t
+};
+
+#[inline(always)]
+fn days(year: u32, month: u32, day: u32) -> i64 {
+    let at = (year.wrapping_sub(TABLE_FIRST_YEAR) as usize) * 12 + month as usize - 1;
+    match MONTH_START.get(at) {
+        Some(&first) if year >= TABLE_FIRST_YEAR => first as i64 + day as i64 - 1,
+        _ => days_from_civil(year as i64, month as i64, day as i64),
+    }
 }
 
 #[inline]
@@ -104,7 +127,7 @@ fn parse_civil(b: &[u8]) -> Option<i64> {
         }
         sign * (oh as i64 * 60 + om as i64)
     };
-    let days = days_from_civil(year as i64, month as i64, day as i64);
+    let days = days(year, month, day);
     let local = (days * 86_400 + hour as i64 * 3_600 + minute as i64 * 60 + second as i64) * SECOND;
     Some(local - offset_minutes * 60 * SECOND)
 }
@@ -131,6 +154,16 @@ mod tests {
             assert_eq!(parse(bad), None, "{:?}", String::from_utf8_lossy(bad));
         }
         assert!(parse(b"2028-02-29T10:00:00Z").is_some());
+        // The month table agrees with the formula everywhere, including outside its range.
+        for year in [0u32, 1, 1899, 1900, 1970, 2000, 2024, 2028, 2100, 2199, 2200, 9999] {
+            for month in 1..=12u32 {
+                for day in [1u32, 15, 28] {
+                    assert_eq!(days(year, month, day), days_from_civil(year as i64, month as i64, day as i64));
+                }
+            }
+        }
+        assert_eq!(parse(b"0000-01-01T00:00:00Z"), Some(days_from_civil(0, 1, 1) * DAY));
+        assert_eq!(parse(b"1970-01-01T00:00:00Z"), Some(0));
         assert!(parse("２０26-10-03T10:00:00Z".as_bytes()).is_none());
         assert!(parse("٢٥٠".as_bytes()).is_none());
     }
