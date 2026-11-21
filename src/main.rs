@@ -193,7 +193,11 @@ fn parallel<S: Send>(
 
 #[inline(always)]
 fn bucket(k: Key, n: usize) -> usize {
-    ((key::hash(k) >> 40) as usize) % n
+    // Hash bits 40..64 scaled to 0..n by a multiply and a shift (n <= 4096, so no overflow). A
+    // `%` by the runtime `n` compiles to a 64-bit DIV: 40-90 cycles on Cascade Lake, at least
+    // twice per event.
+    debug_assert!(n <= 1 << 16);
+    (((key::hash(k) >> 40) * n as u64) >> 24) as usize
 }
 
 fn read_small(path: &Path) -> Vec<u8> {
