@@ -642,6 +642,8 @@ struct Agg {
     active: Vec<u32>,
     pos: Vec<u32>,
     catsum: Vec<i64>,
+    day_purchase: bool, // catsum holds something for the current person-day
+    lows: Vec<u64>,     // scratch: one person's events as ts << 32 | price << 8 | category
 }
 
 impl Agg {
@@ -678,23 +680,29 @@ impl Agg {
 
 fn flush_day(agg: &mut Agg, person: Key, day: i64, sessions: i64, events: i64, revenue: i64) {
     let mut top = NO_CATEGORY;
-    let mut best = 0;
-    for (i, s) in agg.catsum.iter_mut().enumerate() {
-        if *s > best {
-            best = *s;
-            top = i as u16;
+    // Most person-days have no purchase: then there is no category to pick and nothing to reset.
+    if agg.day_purchase {
+        agg.day_purchase = false;
+        let mut best = 0;
+        for (i, s) in agg.catsum.iter_mut().enumerate() {
+            if *s > best {
+                best = *s;
+                top = i as u16;
+            }
+            *s = 0;
         }
-        *s = 0;
     }
     agg.rows.push(UserRow { person, day: day as i32, sessions, events, revenue, top });
 }
 
+/// The time (ms since window_start) of an event stored as `ts << 32 | price << 8 | category`.
 #[inline(always)]
-fn ev_ts(x: u128) -> u32 {
+fn ev_ts(x: u64) -> u32 {
     (x >> 32) as u32
 }
 
-fn process_person(ctx: &Ctx, agg: &mut Agg, person: Key, evs: &[u128], clicks: &[ClickRec]) {
+/// One person's events (sorted `ts << 32 | price << 8 | category`) and clicks (sorted by ts).
+fn process_person(ctx: &Ctx, agg: &mut Agg, person: Key, evs: &[u64], clicks: &[ClickRec]) {
     let organic = ctx.campaign_ids.len();
     let ndays = ctx.ndays;
     let (mut l, mut r) = (0usize, 0usize);
@@ -725,6 +733,7 @@ fn process_person(ctx: &Ctx, agg: &mut Agg, person: Key, evs: &[u128], clicks: &
                 let price = (pc >> 8) as i64;
                 revenue += price;
                 purchased = true;
+                agg.day_purchase = true;
                 agg.catsum[(pc & 0xFF) as usize] += price;
             }
         }
@@ -1174,6 +1183,8 @@ fn main() {
             active: Vec::new(),
             pos: vec![0; ncamp + 1],
             catsum: vec![0; ctx.categories.len()],
+            day_purchase: false,
+            lows: Vec::new(),
         },
         |agg, task| {
             let q = order[task];
@@ -1198,26 +1209,42 @@ fn main() {
                     continue;
                 }
                 let cks = &mut cks[ck_at[b]..ck_at[b + 1]];
-                evs.sort_unstable();
                 cks.sort_unstable_by_key(|c| (c.person, c.ts, c.cid));
-                let mut ci = 0;
-                let mut i = 0;
-                while i < evs.len() {
-                    let p = (evs[i] >> 64) as u64;
-                    let mut j = i + 1;
-                    while j < evs.len() && (evs[j] >> 64) as u64 == p {
-                        j += 1;
+                let mut lows = std::mem::take(&mut agg.lows);
+                let first = (evs[0] >> 64) as u64;
+                if evs.iter().all(|&x| (x >> 64) as u64 == first) {
+                    // The usual bin: one person. Their events sort as 64-bit (ts, payload)
+                    // values, which is much cheaper than sorting 128-bit (person, ts, payload).
+                    lows.clear();
+                    lows.extend(evs.iter().map(|&x| x as u64));
+                    lows.sort_unstable();
+                    let c0 = cks.partition_point(|c| c.person < first);
+                    let c1 = c0 + cks[c0..].partition_point(|c| c.person == first);
+                    process_person(&ctx, agg, first, &lows, &cks[c0..c1]);
+                } else {
+                    evs.sort_unstable();
+                    let mut ci = 0;
+                    let mut i = 0;
+                    while i < evs.len() {
+                        let p = (evs[i] >> 64) as u64;
+                        let mut j = i + 1;
+                        while j < evs.len() && (evs[j] >> 64) as u64 == p {
+                            j += 1;
+                        }
+                        while ci < cks.len() && cks[ci].person < p {
+                            ci += 1;
+                        }
+                        let c0 = ci;
+                        while ci < cks.len() && cks[ci].person == p {
+                            ci += 1;
+                        }
+                        lows.clear();
+                        lows.extend(evs[i..j].iter().map(|&x| x as u64));
+                        process_person(&ctx, agg, p, &lows, &cks[c0..ci]);
+                        i = j;
                     }
-                    while ci < cks.len() && cks[ci].person < p {
-                        ci += 1;
-                    }
-                    let c0 = ci;
-                    while ci < cks.len() && cks[ci].person == p {
-                        ci += 1;
-                    }
-                    process_person(&ctx, agg, p, &evs[i..j], &cks[c0..ci]);
-                    i = j;
                 }
+                agg.lows = lows;
             }
         },
     );
