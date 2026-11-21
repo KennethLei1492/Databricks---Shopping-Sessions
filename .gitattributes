@@ -1,0 +1,2 @@
+# Keep every byte as written: some fixtures hold deliberate CR LF line endings.
+* -text
