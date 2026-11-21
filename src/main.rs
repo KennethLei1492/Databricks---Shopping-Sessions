@@ -898,17 +898,19 @@ struct DedupRec {
     pref: u32, // thread << REF_BITS | that thread's count of valid copies before this one
 }
 
-/// A valid event copy, in its person's bucket. `tseq` is its DedupRec's `pref`, so the sessions
-/// phase can drop the copies that lost dedup.
+/// A valid event copy, in its person's bucket: 16 bytes, four to a cache line. `tseq` is its
+/// DedupRec's `pref`, so the sessions phase can drop the copies that lost dedup. A purchase has
+/// PURCHASE set in `ts`; its price and category are then in the parsing thread's `pcs[seq]`.
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct PEv {
     person: Key,
     ts: u32,
-    pc: u32,
     tseq: u32,
-    _pad: u32, // explicit: whole-record SIMD copies read no uninitialized bytes
 }
+
+/// Flag in PEv::ts (window offsets are below 2^31 ms, about 24.8 days).
+const PURCHASE: u32 = 1 << 31;
 
 const NOREF: u32 = u32::MAX;
 const REF_BITS: u32 = 26; // up to 64 threads and 67M valid events per thread
@@ -984,7 +986,8 @@ struct ParseState {
     thread: usize,
     buf: Vec<u8>,
     events: scatter::Scatter<DedupRec, 4>,
-    sess: scatter::Scatter<PEv, 8>,
+    sess: scatter::Scatter<PEv, 4>,
+    pcs: Vec<u32>, // price << 8 | category of this thread's valid copies, by sequence number
     clicks: scatter::Scatter<ClickRec, 2>,
     nseq: usize,
     ev_ring: Ring<EvPending>,
@@ -1046,6 +1049,8 @@ fn main() {
     let ev_estimate = events_in.bytes() / 56 / np / threads + 64;
     let sess_estimate = events_in.bytes() / 56 / nq / threads + 64;
     let ck_estimate = clicks_in.bytes() / 30 / nq / threads + 64;
+    let pcs_estimate = events_in.bytes() / 56 / threads + 64;
+    assert!(ctx.we - ctx.ws < PURCHASE as i64, "window too long for 31-bit time offsets");
     let n_tasks = ev_chunks.len() + ck_chunks.len();
 
     // ---- parse: each event copy goes to its event-id bucket (for dedup) and, if valid, to its
@@ -1060,16 +1065,18 @@ fn main() {
             buf: Vec::new(),
             events: scatter::Scatter::new(np, ev_estimate),
             sess: scatter::Scatter::new(nq, sess_estimate),
+            pcs: Vec::with_capacity(pcs_estimate),
             clicks: scatter::Scatter::new(nq, ck_estimate),
             nseq: 0,
             ev_ring: Ring::new(),
             ck_ring: Ring::new(),
         },
         |st, task| {
-            let ParseState { thread, buf, events, sess, clicks, nseq, ev_ring, ck_ring } = st;
+            let ParseState { thread, buf, events, sess, pcs, clicks, nseq, ev_ring, ck_ring } = st;
             let thread = *thread as u32;
             let mut to_bucket = |x: EvPending, person: Key| {
-                sess.push(bucket(person, nq), PEv { person, ts: x.ts, pc: x.pc, tseq: x.tseq, _pad: 0 });
+                let flag = if x.pc != 0 { PURCHASE } else { 0 };
+                sess.push(bucket(person, nq), PEv { person, ts: x.ts | flag, tseq: x.tseq });
             };
             if task < ev_chunks.len() {
                 events_in.records::<7>(ev_chunks[task], buf, |f| {
@@ -1080,6 +1087,7 @@ fn main() {
                             assert!(*nseq < (1 << REF_BITS) - 1, "too many events on one thread for a 26-bit reference");
                             let pref = thread << REF_BITS | *nseq as u32;
                             *nseq += 1;
+                            pcs.push(rec.pc);
                             let pending = EvPending { user: rec.user, ts: rec.ts, pc: rec.pc, tseq: pref };
                             ev_ring.push(&persons, pending, &mut to_bucket);
                             pref
@@ -1107,8 +1115,10 @@ fn main() {
     let mut sess_threads = Vec::with_capacity(parsed.len());
     let mut ck_threads = Vec::with_capacity(parsed.len());
     let mut valid = vec![0usize; threads];
+    let mut pcs: Vec<Vec<u32>> = (0..threads).map(|_| Vec::new()).collect();
     for st in parsed {
         valid[st.thread] = st.nseq;
+        pcs[st.thread] = st.pcs;
         ev_threads.push(st.events.finish());
         sess_threads.push(st.sess.finish());
         ck_threads.push(st.clicks.finish());
@@ -1213,7 +1223,12 @@ fn main() {
             let ev_slices: Vec<&[PEv]> = ev_pieces.iter().map(|p| p.as_slice()).collect();
             let ck_slices: Vec<&[ClickRec]> = ck_pieces.iter().map(|p| p.as_slice()).collect();
             let (mut evs, ev_at) = bin_scatter(&ev_slices, nb, |x: &PEv| bin(x.person), |x: &PEv| !lost(x), |x: &PEv| {
-                (x.person as u128) << 64 | (x.ts as u128) << 32 | x.pc as u128
+                let pc = if x.ts & PURCHASE != 0 {
+                    pcs[(x.tseq >> REF_BITS) as usize][(x.tseq & ((1 << REF_BITS) - 1)) as usize]
+                } else {
+                    0
+                };
+                (x.person as u128) << 64 | ((x.ts & !PURCHASE) as u128) << 32 | pc as u128
             });
             let (mut cks, ck_at) = bin_scatter(&ck_slices, nb, |c: &ClickRec| bin(c.person), |_| true, |c: &ClickRec| *c);
             drop(ev_slices);
