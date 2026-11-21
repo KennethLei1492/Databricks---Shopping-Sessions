@@ -17,7 +17,6 @@ mod scatter;
 mod ts;
 
 use key::{pack, Key, KeyMap};
-use parquet::data_type::ByteArray;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -1092,7 +1091,9 @@ fn main() {
                 for r in piece.as_slice() {
                     let mut slot = key::hash(r.eid) as usize & mask;
                     loop {
-                        let s = &mut st.table[slot];
+                        debug_assert!(slot < st.table.len());
+                        // SAFETY: slot <= mask = cap - 1 < table.len() (resized above).
+                        let s = unsafe { st.table.get_unchecked_mut(slot) };
                         if s.eid == key::EMPTY {
                             *s = *r;
                             st.used.push(slot as u32);
@@ -1165,12 +1166,14 @@ fn main() {
             let (is_click, li, s, e) = ranges[task];
             if is_click {
                 let list = &ck_lists[li][s..e];
+                let last = list.len().saturating_sub(1);
                 for i in 0..list.len() {
-                    if let Some(next) = list.get(i + 2 * PREFETCH) {
-                        persons.prefetch_filter(next.person);
-                    }
-                    if let Some(next) = list.get(i + PREFETCH) {
-                        persons.prefetch_slot(next.person);
+                    // Look-ahead clamped to the last record (prefetching it again is harmless), so
+                    // the loop has no bounds branches.
+                    // SAFETY: every index below is at most last < list.len().
+                    unsafe {
+                        persons.prefetch_filter(list.get_unchecked((i + 2 * PREFETCH).min(last)).person);
+                        persons.prefetch_slot(list.get_unchecked((i + PREFETCH).min(last)).person);
                     }
                     let mut c = list[i];
                     let person = persons.get(c.person);
@@ -1181,12 +1184,12 @@ fn main() {
             }
             let pay = &payloads[li][s..e];
             let lost = &losers[li];
+            let last = pay.len().saturating_sub(1);
             for i in 0..pay.len() {
-                if let Some(next) = pay.get(i + 2 * PREFETCH) {
-                    persons.prefetch_filter(next.user);
-                }
-                if let Some(next) = pay.get(i + PREFETCH) {
-                    persons.prefetch_slot(next.user);
+                // SAFETY: every index below is at most last < pay.len().
+                unsafe {
+                    persons.prefetch_filter(pay.get_unchecked((i + 2 * PREFETCH).min(last)).user);
+                    persons.prefetch_slot(pay.get_unchecked((i + PREFETCH).min(last)).user);
                 }
                 let g = s + i;
                 if lost[g / 64].load(Ordering::Relaxed) >> (g % 64) & 1 != 0 {
@@ -1322,7 +1325,6 @@ fn main() {
     if pieces.is_empty() {
         pieces.push((0, 0, 0)); // user_daily still needs one (empty) file
     }
-    let cat_bytes: Vec<bytes::Bytes> = ctx.categories.iter().map(|c| bytes::Bytes::from(c.clone())).collect();
     let campaign_rows = AtomicUsize::new(0);
     parallel("write", threads, pieces.len() + 1, || (), |_, task| {
         if task == pieces.len() {
@@ -1332,47 +1334,29 @@ fn main() {
         let (li, s, e) = pieces[task];
         let rows = &row_lists.get(li).map_or(&[][..], |l| &l[s..e]);
         let n = rows.len();
-        let mut user_id = Vec::with_capacity(n);
-        let mut day = Vec::with_capacity(n);
-        let mut sessions = Vec::with_capacity(n);
-        let mut events = Vec::with_capacity(n);
-        let mut revenue = Vec::with_capacity(n);
-        let mut top = Vec::with_capacity(n);
-        let mut top_def = Vec::with_capacity(n);
-        // All names in one buffer, sliced per row: no allocation per string.
-        let mut names = Vec::with_capacity(n * 10);
-        let mut ends = Vec::with_capacity(n);
-        for r in rows.iter() {
-            key::append_bytes(r.person, &mut names);
-            ends.push(names.len());
-        }
-        let names = bytes::Bytes::from(names);
-        let mut from = 0;
-        for (r, &end) in rows.iter().zip(&ends) {
-            user_id.push(ByteArray::from(names.slice(from..end)));
-            from = end;
-            day.push(r.day);
-            sessions.push(r.sessions);
-            events.push(r.events);
-            revenue.push(r.revenue);
-            if r.top == NO_CATEGORY {
-                top_def.push(0);
-            } else {
-                top_def.push(1);
-                top.push(ByteArray::from(cat_bytes[r.top as usize].clone()));
+        let mut user_id = out::Col::with_capacity(n * 16);
+        let mut day = out::Col::with_capacity(n * 4);
+        let mut sessions = out::Col::with_capacity(n * 8);
+        let mut events = out::Col::with_capacity(n * 8);
+        let mut revenue = out::Col::with_capacity(n * 8);
+        let mut top = out::Col::with_capacity(n * 4);
+        for (i, r) in rows.iter().enumerate() {
+            user_id.push_str_with(|buf| key::append_bytes(r.person, buf));
+            day.push_i32(r.day);
+            sessions.push_i64(r.sessions);
+            events.push_i64(r.events);
+            revenue.push_i64(r.revenue);
+            let present = r.top != NO_CATEGORY;
+            top.set_present(i, present);
+            if present {
+                top.push_str(&ctx.categories[r.top as usize]);
             }
         }
         out::write(
             &ud_dir.join(format!("part-{task:05}.parquet")),
-            out::USER_SCHEMA,
-            vec![
-                out::Column::Bytes(user_id),
-                out::Column::I32(day),
-                out::Column::I64(sessions),
-                out::Column::I64(events),
-                out::Column::I64(revenue),
-                out::Column::OptBytes(top, top_def),
-            ],
+            "user_daily",
+            &out::USER,
+            &[user_id, day, sessions, events, revenue, top],
             n,
         );
     });
@@ -1387,10 +1371,11 @@ fn main() {
 /// Writes campaign_daily from the summed (campaign or organic) x day cells; returns its rows.
 fn write_campaigns(ctx: &Ctx, camp_total: &[[i64; 4]], cd_dir: &Path) -> usize {
     let ncamp = ctx.campaign_ids.len();
-    let mut campaign_id = Vec::new();
-    let mut channel = Vec::new();
-    let mut day = Vec::new();
-    let mut cols: [Vec<i64>; 4] = Default::default();
+    let mut campaign_id = out::Col::default();
+    let mut channel = out::Col::default();
+    let mut day = out::Col::default();
+    let mut cols: [out::Col; 4] = Default::default();
+    let mut n = 0;
     for c in 0..=ncamp {
         for d in 0..ctx.ndays {
             let cell = camp_total[c * ctx.ndays + d];
@@ -1398,33 +1383,20 @@ fn write_campaigns(ctx: &Ctx, camp_total: &[[i64; 4]], cd_dir: &Path) -> usize {
                 continue;
             }
             if c == ncamp {
-                campaign_id.push(ByteArray::from(&b"organic"[..]));
-                channel.push(ByteArray::from(&b"organic"[..]));
+                campaign_id.push_str(b"organic");
+                channel.push_str(b"organic");
             } else {
-                campaign_id.push(ByteArray::from(ctx.campaign_ids[c].clone()));
-                channel.push(ByteArray::from(ctx.channels[c].clone()));
+                campaign_id.push_str(&ctx.campaign_ids[c]);
+                channel.push_str(&ctx.channels[c]);
             }
-            day.push((ctx.day0 + d as i64) as i32);
+            day.push_i32((ctx.day0 + d as i64) as i32);
             for k in 0..4 {
-                cols[k].push(cell[k]);
+                cols[k].push_i64(cell[k]);
             }
+            n += 1;
         }
     }
-    let n = day.len();
     let [s, p, r, a] = cols;
-    out::write(
-        &cd_dir.join("part-00000.parquet"),
-        out::CAMPAIGN_SCHEMA,
-        vec![
-            out::Column::Bytes(campaign_id),
-            out::Column::Bytes(channel),
-            out::Column::I32(day),
-            out::Column::I64(s),
-            out::Column::I64(p),
-            out::Column::I64(r),
-            out::Column::I64(a),
-        ],
-        n,
-    );
+    out::write(&cd_dir.join("part-00000.parquet"), "campaign_daily", &out::CAMPAIGN, &[campaign_id, channel, day, s, p, r, a], n);
     n
 }

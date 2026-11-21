@@ -49,25 +49,33 @@ impl<T: Copy + Default, const K: usize> Scatter<T, K> {
         }
     }
 
+    /// Adds `x` to bucket `b` (`b < n`, which is checked only in debug builds: callers compute
+    /// it with a multiply-shift that cannot exceed n - 1).
     #[inline(always)]
     pub fn push(&mut self, b: usize, x: T) {
-        let f = self.fill[b] as usize;
-        self.stage[b].0[f] = x;
-        if f + 1 == K {
-            self.fill[b] = 0;
-            let line = self.stage[b];
-            let bucket = &mut self.buckets[b];
-            bucket.lines.reserve(1);
-            // SAFETY: capacity for one more line was reserved; the destination is 64-byte aligned
-            // (Line is align(64)), and 64 bytes are written before the length grows.
-            unsafe {
+        debug_assert!(b < self.fill.len());
+        // SAFETY: b < n = fill.len() = stage.len() = buckets.len() (all made in `new`), and
+        // fill[b] < K always (it wraps to 0 when it reaches K).
+        unsafe {
+            let fill = self.fill.get_unchecked_mut(b);
+            let f = *fill as usize;
+            let stage = self.stage.get_unchecked_mut(b);
+            *stage.0.get_unchecked_mut(f) = x;
+            if f + 1 == K {
+                *fill = 0;
+                let bucket = self.buckets.get_unchecked_mut(b);
+                if bucket.lines.len() == bucket.lines.capacity() {
+                    grow(&mut bucket.lines);
+                }
+                // The destination is 64-byte aligned (Line is align(64)) and inside the
+                // capacity checked above; 64 bytes are written before the length grows.
                 let dst = bucket.lines.as_mut_ptr().add(bucket.lines.len());
-                stream_line(dst as *mut u8, &line as *const Line<T, K> as *const u8);
+                stream_line(dst as *mut u8, stage as *const Line<T, K> as *const u8);
                 bucket.lines.set_len(bucket.lines.len() + 1);
+                bucket.len += K;
+            } else {
+                *fill = (f + 1) as u8;
             }
-            bucket.len += K;
-        } else {
-            self.fill[b] = (f + 1) as u8;
         }
     }
 
@@ -89,6 +97,13 @@ impl<T: Copy + Default, const K: usize> Scatter<T, K> {
         };
         self.buckets
     }
+}
+
+/// Room for more lines in a bucket (rare: capacities are estimated with headroom).
+#[cold]
+#[inline(never)]
+fn grow<L>(lines: &mut Vec<L>) {
+    lines.reserve(lines.len().max(16));
 }
 
 /// Copies 64 bytes from `src` to the 64-byte aligned `dst` with non-temporal stores.

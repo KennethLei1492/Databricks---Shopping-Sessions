@@ -177,13 +177,15 @@ pub fn append_bytes(k: Key, out: &mut Vec<u8>) {
         let shard = interner()[(id % SHARDS as u64) as usize].lock().unwrap();
         out.extend_from_slice(&shard.strings[(id / SHARDS as u64) as usize]);
     } else {
-        for i in 0..MAX_FAST {
-            let d = (k >> (6 * (MAX_FAST - 1 - i))) & 63;
-            if d == 0 {
-                break;
-            }
-            out.push(CHAR[d as usize]);
+        // All ten codes into a stack buffer, then one copy of the non-padding prefix.
+        let mut buf = [0u8; MAX_FAST];
+        let mut n = 0;
+        for (i, b) in buf.iter_mut().enumerate() {
+            let d = ((k >> (6 * (MAX_FAST - 1 - i))) & 63) as usize;
+            *b = CHAR[d];
+            n += (d != 0) as usize;
         }
+        out.extend_from_slice(&buf[..n]);
     }
 }
 
