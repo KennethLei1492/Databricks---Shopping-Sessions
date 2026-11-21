@@ -226,32 +226,6 @@ impl<V: Copy + Default> KeyMap<V> {
         hash(k) as usize & self.mask
     }
 
-    /// Starts loading the cache line where `k` would be, for a lookup a few iterations later.
-    #[inline(always)]
-    pub fn prefetch(&self, k: Key) {
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: prefetch is a hint; the address is inside the keys allocation.
-        unsafe {
-            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            _mm_prefetch(self.keys.as_ptr().add(self.slot(k)) as *const i8, _MM_HINT_T0);
-        }
-    }
-
-    #[inline]
-    pub fn get(&self, k: Key) -> Option<V> {
-        let mut at = self.slot(k);
-        loop {
-            let found = self.keys[at];
-            if found == k {
-                return Some(self.vals[at]);
-            }
-            if found == EMPTY {
-                return None;
-            }
-            at = (at + 1) & self.mask;
-        }
-    }
-
     /// The slot for k, inserting `default` first when absent. Returns (value, was present).
     #[inline]
     pub fn entry(&mut self, k: Key, default: V) -> (&mut V, bool) {
@@ -282,10 +256,6 @@ impl<V: Copy + Default> KeyMap<V> {
             }
         }
         *self = bigger;
-    }
-
-    pub fn len(&self) -> usize {
-        self.len
     }
 }
 

@@ -1,6 +1,6 @@
 //! The CSV dialect of rules.md: only `\n` ends a line, the first line of every file is its header,
 //! a field is quoted only as a whole, and a line with the wrong field count or a stray quote is
-//! dropped. Files are read with pread and cut into line-aligned chunks for parallel parsing.
+//! dropped. Files are memory-mapped and cut into line-aligned chunks for parallel parsing.
 
 use memchr::{memchr, memchr_iter};
 use std::fs::File;
@@ -9,10 +9,16 @@ use std::path::{Path, PathBuf};
 
 const NL: u8 = 10;
 
-/// Input files read with `pread` into per-thread buffers (no mmap: page faults are costly in VMs).
+/// Input files, memory-mapped and parsed in place (no copy into user buffers). Each chunk's
+/// pages are mapped in one call (MADV_POPULATE_READ, ignored where unsupported) just before it is
+/// parsed. `SS_MMAP=1` skips that call; `SS_MMAP=0` reads with `pread` into per-thread buffers,
+/// which is also how the last bytes of each file are read (the parser needs SLACK bytes after
+/// a chunk).
 pub struct Input {
     files: Vec<File>,
     sizes: Vec<usize>,
+    maps: Vec<Option<memmap2::Mmap>>,
+    populate: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -37,17 +43,21 @@ pub fn list_csv(dir: &Path) -> Vec<PathBuf> {
 
 impl Input {
     pub fn open(paths: &[PathBuf]) -> Input {
+        let mode: u32 = std::env::var("SS_MMAP").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
         let mut files = Vec::new();
         let mut sizes = Vec::new();
+        let mut maps = Vec::new();
         for path in paths {
             let file = File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
             let len = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
             if len > 0 {
+                // SAFETY: the input is a read-only mount that nothing modifies during the run.
+                maps.push(if mode > 0 { unsafe { memmap2::Mmap::map(&file) }.ok() } else { None });
                 files.push(file);
                 sizes.push(len);
             }
         }
-        Input { files, sizes }
+        Input { files, sizes, maps, populate: mode > 1 }
     }
 
     pub fn bytes(&self) -> usize {
@@ -118,6 +128,24 @@ impl Input {
     #[inline]
     pub fn records<const N: usize>(&self, chunk: Chunk, buf: &mut Vec<u8>, mut f: impl FnMut(&Rec<'_, N>)) {
         let len = chunk.end - chunk.start;
+        // In place from the mapping when SLACK bytes after the chunk are still inside the file.
+        if let Some(map) = &self.maps[chunk.file] {
+            if chunk.end + SLACK <= self.sizes[chunk.file] {
+                if self.populate {
+                    let _ = map.advise_range(memmap2::Advice::PopulateRead, chunk.start, len + SLACK);
+                }
+                let data = &map[chunk.start..chunk.end + SLACK];
+                let mut at = 0;
+                if chunk.start == 0 {
+                    match memchr(NL, &data[..len]) {
+                        Some(nl) => at = nl + 1,
+                        None => return,
+                    }
+                }
+                parse_records::<N>(data, len, at, &mut f);
+                return;
+            }
+        }
         if buf.len() < len + SLACK {
             buf.resize(len + SLACK, 0);
         }
@@ -148,6 +176,13 @@ impl<'a, const N: usize> Rec<'a, N> {
     pub fn get(&self, i: usize) -> &'a [u8] {
         let (s, e) = self.at[i];
         &self.data[s..e]
+    }
+
+    /// The length of field `i`, unquoted.
+    #[inline(always)]
+    pub fn len(&self, i: usize) -> usize {
+        let (s, e) = self.at[i];
+        e - s
     }
 
     /// 16 bytes starting at field `i` (bytes past the field are arbitrary).
@@ -266,23 +301,26 @@ fn emit<const N: usize>(
         *r = (s, e);
         s = e + 1;
     }
-    if quotes != 0 {
-        // Strip fields that start with a quote (they must end with one and be at least 2 long).
-        // Any other quote (inside, or only at the end) leaves the count unmatched.
-        let mut stripped = 0u32;
-        for r in at.iter_mut() {
-            let (s, e) = *r;
-            if e > s && data[s] == b'"' {
-                if e - s < 2 || data[e - 1] != b'"' {
-                    return;
-                }
-                *r = (s + 1, e - 1);
-                stripped += 2;
-            }
-        }
-        if stripped != quotes {
-            return;
-        }
+    // Strip fields that start with a quote (they must end with one and be at least 2 long). Any
+    // other quote (inside, or only at the end) leaves the count unmatched. Branch-free: about a
+    // fifth of fields are quoted at random, so a branch per field would mispredict constantly.
+    if quotes == 0 {
+        f(&Rec { data, at });
+        return;
+    }
+    let mut stripped = 0u32;
+    let mut bad = 0usize;
+    for r in at.iter_mut() {
+        let (s, e) = *r;
+        // data[s] is readable even for an empty field (SLACK bytes follow the data).
+        let first = (e > s) as usize & (data[s] == b'"') as usize;
+        let last_ok = (e >= s + 2) as usize & (data[e.max(1) - 1] == b'"') as usize;
+        bad |= first & (last_ok ^ 1);
+        *r = (s + first, e - first);
+        stripped += 2 * first as u32;
+    }
+    if bad != 0 || stripped != quotes {
+        return;
     }
     f(&Rec { data, at });
 }
