@@ -116,21 +116,49 @@ impl Input {
     /// Calls `f` with the unquoted fields of every well-formed N-field line of the chunk, skipping
     /// the file's header line. Same results as `lines` + `split`, in one SIMD pass.
     #[inline]
-    pub fn records<const N: usize>(&self, chunk: Chunk, buf: &mut Vec<u8>, mut f: impl FnMut(&[&[u8]; N])) {
+    pub fn records<const N: usize>(&self, chunk: Chunk, buf: &mut Vec<u8>, mut f: impl FnMut(&Rec<'_, N>)) {
         let len = chunk.end - chunk.start;
-        if buf.len() < len {
-            buf.resize(len, 0);
+        if buf.len() < len + SLACK {
+            buf.resize(len + SLACK, 0);
         }
         self.files[chunk.file].read_exact_at(&mut buf[..len], chunk.start as u64).expect("read");
-        let data = &buf[..len];
         let mut at = 0;
         if chunk.start == 0 {
-            match memchr(NL, data) {
+            match memchr(NL, &buf[..len]) {
                 Some(nl) => at = nl + 1,
                 None => return,
             }
         }
-        parse_records::<N>(data, at, &mut f);
+        parse_records::<N>(&buf[..len + SLACK], len, at, &mut f);
+    }
+}
+
+/// Readable bytes after the parsed data, so a field can always be read as a 16-byte window.
+pub const SLACK: usize = 64;
+
+/// One well-formed line: field ranges into a buffer that has SLACK readable bytes past the data.
+pub struct Rec<'a, const N: usize> {
+    data: &'a [u8],
+    at: [(usize, usize); N],
+}
+
+impl<'a, const N: usize> Rec<'a, N> {
+    /// Field `i`, unquoted.
+    #[inline(always)]
+    pub fn get(&self, i: usize) -> &'a [u8] {
+        let (s, e) = self.at[i];
+        &self.data[s..e]
+    }
+
+    /// 16 bytes starting at field `i` (bytes past the field are arbitrary).
+    #[inline(always)]
+    pub fn wide(&self, i: usize) -> &'a [u8; 16] {
+        let s = self.at[i].0;
+        self.data[s..s + 16].try_into().unwrap()
+    }
+
+    pub fn fields(&self) -> [&'a [u8]; N] {
+        std::array::from_fn(|i| self.get(i))
     }
 }
 
@@ -165,12 +193,13 @@ fn masks(block: &[u8; 64]) -> (u64, u64, u64) {
     (nl, comma, quote)
 }
 
-/// Splits `data[start..]` into lines and fields with one bitmask pass. A line is well-formed when
-/// it has exactly N-1 commas and every quote is the first or last byte of a field that starts and
-/// ends with one (length >= 2): then the line's quote count is exactly 2 per quoted field.
-pub fn parse_records<const N: usize>(data: &[u8], start: usize, f: &mut impl FnMut(&[&[u8]; N])) {
+/// Splits `data[start..len]` into lines and fields with one bitmask pass; `data` must hold SLACK
+/// bytes past `len`. A line is well-formed when it has exactly N-1 commas and every quote is the
+/// first or last byte of a field that starts and ends with one (length >= 2): then the line's
+/// quote count is exactly 2 per quoted field.
+pub fn parse_records<const N: usize>(data: &[u8], len: usize, start: usize, f: &mut impl FnMut(&Rec<'_, N>)) {
     const { assert!(N >= 2 && N <= 16) };
-    let len = data.len();
+    assert!(data.len() >= len + SLACK);
     let mut cuts = [0usize; 16];
     let mut commas = 0usize;
     let mut line_start = start;
@@ -182,7 +211,7 @@ pub fn parse_records<const N: usize>(data: &[u8], start: usize, f: &mut impl FnM
             data[block_at..block_at + 64].try_into().unwrap()
         } else {
             tail.fill(0);
-            tail[..len - block_at].copy_from_slice(&data[block_at..]);
+            tail[..len - block_at].copy_from_slice(&data[block_at..len]);
             &tail
         };
         let (nl, comma, quote) = masks(block);
@@ -225,37 +254,37 @@ fn emit<const N: usize>(
     cuts: &[usize; 16],
     commas: usize,
     quotes: u32,
-    f: &mut impl FnMut(&[&[u8]; N]),
+    f: &mut impl FnMut(&Rec<'_, N>),
 ) {
     if commas != N - 1 {
         return; // wrong field count; an empty line has 0 commas
     }
-    let mut fields: [&[u8]; N] = [&[]; N];
+    let mut at = [(0usize, 0usize); N];
     let mut s = line_start;
-    for (i, field) in fields.iter_mut().enumerate() {
+    for (i, r) in at.iter_mut().enumerate() {
         let e = if i < N - 1 { cuts[i] } else { line_end };
-        *field = &data[s..e];
+        *r = (s, e);
         s = e + 1;
     }
     if quotes != 0 {
+        // Strip fields that start with a quote (they must end with one and be at least 2 long).
+        // Any other quote (inside, or only at the end) leaves the count unmatched.
         let mut stripped = 0u32;
-        for field in fields.iter_mut() {
-            let n = field.len();
-            let first = n > 0 && field[0] == b'"';
-            let last = n > 0 && field[n - 1] == b'"';
-            if first || last {
-                if !(first && last && n >= 2) {
+        for r in at.iter_mut() {
+            let (s, e) = *r;
+            if e > s && data[s] == b'"' {
+                if e - s < 2 || data[e - 1] != b'"' {
                     return;
                 }
-                *field = &field[1..n - 1];
+                *r = (s + 1, e - 1);
                 stripped += 2;
             }
         }
         if stripped != quotes {
-            return; // a quote inside a field
+            return;
         }
     }
-    f(&fields);
+    f(&Rec { data, at });
 }
 
 /// Splits a line into exactly N fields and strips whole-field quotes; None if malformed.
@@ -335,8 +364,10 @@ mod tests {
                 }
             }
             let mut actual: Vec<Vec<Vec<u8>>> = Vec::new();
-            parse_records::<N>(&data, start, &mut |fields: &[&[u8]; N]| {
-                actual.push(fields.iter().map(|f| f.to_vec()).collect())
+            let mut padded = data.clone();
+            padded.extend_from_slice(&[b'"'; SLACK]);
+            parse_records::<N>(&padded, data.len(), start, &mut |r: &Rec<'_, N>| {
+                actual.push(r.fields().iter().map(|f| f.to_vec()).collect())
             });
             assert_eq!(actual, expected, "data {:?} start {start}", String::from_utf8_lossy(&data));
         }
