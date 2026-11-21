@@ -11,7 +11,6 @@
 //!   5. write Parquet
 
 mod csv;
-mod diag;
 mod key;
 mod out;
 mod scatter;
@@ -1001,12 +1000,6 @@ struct DedupState {
 }
 
 fn main() {
-    // Diagnostic build: the parent reports the machine and times child runs, then sabotages
-    // its own output so the dev-set check fails and returns the logs.
-    let diag_parent = std::env::var("SS_CHILD").is_err();
-    if diag_parent {
-        diag::run();
-    }
     let start = Instant::now();
     let args: Vec<String> = std::env::args().collect();
     let data = PathBuf::from(std::env::var("DATA_DIR").ok().or_else(|| args.get(1).cloned()).unwrap_or("/data".into()));
@@ -1376,11 +1369,6 @@ fn main() {
         start,
         &format!("wrote {total_rows} user_daily rows, {} campaign_daily rows", campaign_rows.load(Ordering::Relaxed)),
     );
-    if diag_parent {
-        // Deliberately wrong: an empty campaign_daily, so the dev check fails and shows the logs.
-        out::write(&cd_dir.join("part-00000.parquet"), out::CAMPAIGN_SCHEMA, Vec::new(), 0);
-        eprintln!("DIAG campaign_daily replaced by an empty table on purpose");
-    }
     // Skip freeing gigabytes of buckets one by one: the process is done.
     std::process::exit(0);
 }
