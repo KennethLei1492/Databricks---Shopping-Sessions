@@ -197,14 +197,13 @@ pub fn cmp(a: Key, b: Key) -> Ordering {
     }
 }
 
+/// A 64-bit mix of the key: one 128-bit multiply, folded. Every output bit depends on every key
+/// bit, which matters because callers take different bit ranges for buckets, tables and bins.
+/// (It runs several times per event, so it is kept to three instructions.)
 #[inline(always)]
 pub fn hash(k: Key) -> u64 {
-    let mut x = k ^ 0x9E37_79B9_7F4A_7C15;
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-    x ^ (x >> 33)
+    let m = (k ^ 0x9E37_79B9_7F4A_7C15) as u128 * 0xD6E8_FEB8_6659_FD93u128;
+    (m >> 64) as u64 ^ m as u64
 }
 
 /// Open-addressing map from Key to a Copy value (linear probing, power-of-two capacity).
@@ -281,6 +280,37 @@ mod tests {
         assert!(pack_fast(b"zzzzzzzzzz").unwrap() < SLOW);
         assert_eq!(pack_fast(b"zzzzzzzzzzz"), None);
         assert_eq!(pack_fast(b"U1"), None);
+    }
+
+    /// Generator-like IDs (a letter plus base-36 digits) must spread evenly over every bit range
+    /// the pipeline uses: buckets (bits 40..), tables (low bits), bins (bits 16..), filter (20..).
+    #[test]
+    fn hash_spreads_packed_ids() {
+        const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        let n = 400_000u64;
+        for (shift, buckets) in [(40u32, 4096usize), (0, 4096), (16, 4096), (20, 4096), (58, 64)] {
+            let mut counts = vec![0u32; buckets];
+            for i in 0..n {
+                // scrambled like the generator: sequential numbers through a 40-bit bijection
+                let mut v = i.wrapping_mul(0x9E37_79B9_7F4B) & ((1 << 40) - 1);
+                v ^= v >> 17;
+                let mut id = vec![b'u'];
+                let mut digits = Vec::new();
+                loop {
+                    digits.push(DIGITS[(v % 36) as usize]);
+                    v /= 36;
+                    if v == 0 {
+                        break;
+                    }
+                }
+                id.extend(digits.iter().rev());
+                let h = hash(pack(&id));
+                counts[(h >> shift) as usize % buckets] += 1;
+            }
+            let mean = n as f64 / buckets as f64;
+            let (min, max) = (*counts.iter().min().unwrap() as f64, *counts.iter().max().unwrap() as f64);
+            assert!(min > mean * 0.6 && max < mean * 1.5, "shift {shift}: min {min} max {max} mean {mean}");
+        }
     }
 
     #[test]

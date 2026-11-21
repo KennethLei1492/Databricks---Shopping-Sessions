@@ -153,11 +153,12 @@ fn parallel<S: Send>(
 ) -> Vec<S> {
     let next = AtomicUsize::new(0);
     let t0 = Instant::now();
-    let results: Vec<(S, f64, f64, usize)> = std::thread::scope(|scope| {
+    let results: Vec<(S, f64, f64, usize, f64)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|_| {
                 scope.spawn(|| {
                     let mut state = init();
+                    let started = t0.elapsed().as_secs_f64();
                     let (mut busy, mut longest, mut longest_task) = (0f64, 0f64, 0usize);
                     loop {
                         let task = next.fetch_add(1, Ordering::Relaxed);
@@ -173,7 +174,7 @@ fn parallel<S: Send>(
                             longest_task = task;
                         }
                     }
-                    (state, busy, longest, longest_task)
+                    (state, busy, longest, longest_task, started)
                 })
             })
             .collect();
@@ -182,8 +183,9 @@ fn parallel<S: Send>(
     let wall = t0.elapsed().as_secs_f64();
     let busy: f64 = results.iter().map(|r| r.1).sum();
     let (longest, longest_task) = results.iter().map(|r| (r.2, r.3)).fold((0f64, 0), |a, b| if b.0 > a.0 { b } else { a });
+    let slowest_start = results.iter().map(|r| r.4).fold(0f64, f64::max);
     eprintln!(
-        "  phase {name}: {n} tasks, wall {wall:.3}s, utilization {:.0}%, longest task #{longest_task} {longest:.3}s",
+        "  phase {name}: {n} tasks, wall {wall:.3}s, utilization {:.0}%, longest task #{longest_task} {longest:.3}s, slowest thread start {slowest_start:.3}s",
         100.0 * busy / (threads as f64 * wall).max(1e-9)
     );
     results.into_iter().map(|r| r.0).collect()

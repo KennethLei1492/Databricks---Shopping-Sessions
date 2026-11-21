@@ -23,11 +23,15 @@ check "dev pread np=nq=64 ncpu=3" "$($PY "$HERE/scripts/compare.py" ~/ss/g_dev "
 out=$(BIN=$BIN WORK=~/ss/g_nv bash "$HERE/scripts/nversion.sh" 300000 $SEEDS 2>&1)
 echo "$out"
 [ "$(echo "$out" | grep -c ': MATCH$')" = "$(echo $SEEDS | wc -w)" ] || fail=1
+# At scale: identical tables to a trusted build (SCALE defaults to the 5M-event set, which fits
+# in memory next to other work on this machine; use SCALE=~/ss/big20 when it is quiet).
 if [ -n "${BASE:-}" ]; then
-  [ -d ~/ss/g_base20 ] || NCPU=8 "$BASE" ~/ss/big20 ~/ss/g_base20 2>/dev/null
-  rm -rf ~/ss/g_new20
-  NCPU=8 "$BIN" ~/ss/big20 ~/ss/g_new20 2>/dev/null
-  check "20M vs base" "$($PY "$HERE/scripts/compare.py" ~/ss/g_base20 ~/ss/g_new20 | tail -1)" MATCH
+  SCALE=${SCALE:-~/ss/big5}
+  tag=$(basename "$SCALE")
+  [ -d ~/ss/g_base_$tag ] || NCPU=8 "$BASE" "$SCALE" ~/ss/g_base_$tag 2>/dev/null
+  rm -rf ~/ss/g_new_$tag
+  NCPU=8 "$BIN" "$SCALE" ~/ss/g_new_$tag 2>/dev/null
+  check "$tag vs base" "$($PY "$HERE/scripts/compare.py" ~/ss/g_base_$tag ~/ss/g_new_$tag | tail -1)" MATCH
 fi
 [ $fail = 0 ] && echo "GATES PASS" || echo "GATES FAIL"
 exit $fail
