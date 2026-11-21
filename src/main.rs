@@ -1028,18 +1028,19 @@ fn main() {
         return;
     }
 
-    // Event-id buckets small enough that a bucket's dedup table stays in L2.
+    // Bucket counts. Parsing writes into every bucket at once through one staging line per
+    // bucket, so the fanout is capped to keep those lines in cache: measured at 8 threads,
+    // 4096/2048 buckets ran 19% slower than 1024/512. Within that cap, buckets are sized so a
+    // dedup table (event-id) or a sessions task (person) stays small.
     let np: usize = std::env::var("SS_NP")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or((events_in.bytes() / 76 / 8192).next_power_of_two())
+        .unwrap_or((events_in.bytes() / 76 / 8192).next_power_of_two().clamp(64, 1024))
         .clamp(64, 4096);
-    // Person buckets small enough that a bucket's events, clicks and their sorted copies stay
-    // in L2 during the sessions phase.
     let nq: usize = std::env::var("SS_NQ")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or((events_in.bytes() / 76 / 16384).next_power_of_two())
+        .unwrap_or((events_in.bytes() / 76 / 16384).next_power_of_two().clamp(64, 512))
         .clamp(64, 4096);
     // Capacities with headroom: a doubling copy of a big array costs far more than slack.
     let ev_estimate = events_in.bytes() / 56 / np / threads + 64;
