@@ -445,7 +445,8 @@ mod tests {
             x
         };
         for case in 0..2_000 {
-            let len = (next() % 400) as usize;
+            // Every fourth case is long enough to span many 64-byte blocks.
+            let len = if case % 4 == 3 { (next() % 12_000) as usize } else { (next() % 400) as usize };
             let mut data: Vec<u8> = (0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
             if case % 2 == 1 {
                 // Long lines: most newlines, commas and quotes become letters, so lines run
@@ -481,6 +482,78 @@ mod tests {
                 actual.push(r.fields().iter().map(|f| f.to_vec()).collect())
             });
             assert_eq!(actual, expected, "data {:?} start {start}", String::from_utf8_lossy(&data));
+        }
+    }
+
+    /// Mostly well-formed lines (the generator's shape: some fields quoted, a few lines damaged),
+    /// so the block splitter's fast path carries most lines.
+    fn check_agrees_clean<const N: usize>(seed: u64) {
+        let mut x = seed | 1;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..300 {
+            let mut data: Vec<u8> = Vec::new();
+            let lines = (next() % 400) as usize;
+            for _ in 0..lines {
+                let fields = if next() % 50 == 0 { (next() % (N as u64 + 2)) as usize } else { N };
+                for i in 0..fields {
+                    if i > 0 {
+                        data.push(b',');
+                    }
+                    let flen = (next() % 24) as usize;
+                    let quoted = next() % 5 == 0;
+                    if quoted {
+                        data.push(b'"');
+                    }
+                    for _ in 0..flen {
+                        data.push(b"abcxyz0189-:T Z"[(next() % 15) as usize]);
+                    }
+                    if quoted {
+                        data.push(b'"');
+                    }
+                    // Damage: a stray or missing quote, or a quoted comma.
+                    match next() % 300 {
+                        0 => data.push(b'"'),
+                        1 if data.last() == Some(&b'"') => {
+                            data.pop();
+                        }
+                        2 => data.extend_from_slice(b"\"x,y\""),
+                        _ => {}
+                    }
+                }
+                if next() % 200 != 0 {
+                    data.push(NL);
+                }
+            }
+            let start = if next() % 2 == 0 { 0 } else { (next() % (data.len() as u64 + 1)) as usize };
+            let body = &data[start..];
+            let mut lines: Vec<&[u8]> = body.split(|&c| c == NL).collect();
+            if body.ends_with(b"\n") || body.is_empty() {
+                lines.pop();
+            }
+            let expected: Vec<Vec<Vec<u8>>> =
+                lines.iter().filter_map(|l| split::<N>(l)).map(|f| f.iter().map(|x| x.to_vec()).collect()).collect();
+            let mut padded = data.clone();
+            padded.extend_from_slice(&[b'"'; SLACK]);
+            let mut actual: Vec<Vec<Vec<u8>>> = Vec::new();
+            parse_records::<N>(&padded, data.len(), start, &mut |r: &Rec<'_, N>| {
+                actual.push(r.fields().iter().map(|f| f.to_vec()).collect())
+            });
+            assert!(expected.len() > lines.len() / 2 || lines.len() < 20, "generator should be mostly clean: {} of {} lines, N {N}", expected.len(), lines.len());
+            assert_eq!(actual, expected, "clean blocks: data {:?} start {start}", String::from_utf8_lossy(&data));
+        }
+    }
+
+    #[test]
+    fn block_splitter_matches_on_mostly_clean_input() {
+        for seed in 1..30 {
+            check_agrees_clean::<2>(seed * 31);
+            check_agrees_clean::<4>(seed * 7907);
+            check_agrees_clean::<7>(seed * 104_723);
         }
     }
 
