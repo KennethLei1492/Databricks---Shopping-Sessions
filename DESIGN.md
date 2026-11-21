@@ -53,7 +53,21 @@ byte-wise order; any other string goes through a small global interner (`src/key
 | 988dfff | light dedup, mmap input, per-line splitter, bitmask quotes, cheap hash | 1.10 s | best 1.36 -> 1.03 s on 20M |
 | faeaf07 | person bucketing fused into parse, fanout cap 1024/512, 16-byte records | 1.18 s | -12% at 8 threads on 5M; did not transfer |
 | b54186b | hash-once person lookups, lock-free parallel links | 1.22 s | cost model -1.5%; did not transfer |
-| (restored) | main's src back to 988dfff, the best scored pipeline | | identical source to 988dfff |
+| ae993de | main's src back to 988dfff, the best scored pipeline | 1.10 s | identical source to 988dfff |
+| 6b69637 | bucket(): multiply-shift instead of a 64-bit DIV per event and click | 1.08 s | invisible to cachegrind (DIV counts as one instruction) |
+| ac6e334 | windowed campaign/product lookup; trusted F1 ingest_ts | 1.04 s | -3.2% instructions |
+
+Tried and dropped (cost model, dev set, no scorer run needed):
+
+- One-pass 64-byte block splitter (separator entries tagged by PEXT, newline ranks): correct on
+  all tests, but 317 instructions per line against ~290 for the per-line splitter.
+- Dedup and person routing merged into one pass over 32-byte records (no payload array, no loser
+  bitmap): +6M instructions and more cache misses; the work moved rather than went away.
+- Branch-free person lookup (filter bit selects home slot or a dummy slot, hash computed once in
+  a ring): -0.2M mispredictions, +8M instructions, no net change.
+
+Budget: the 20M-event set is 1.86 GB. 0.27 s on 4 physical cores at 2.8 GHz is about 2 cycles per
+input byte for everything; the pipeline is at about 8 (about 640 cycles per event line).
 
 Why the two later builds scored worse than 988dfff:
 
