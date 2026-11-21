@@ -20,7 +20,7 @@ use key::{pack, Key, KeyMap};
 use parquet::data_type::ByteArray;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 use ts::DAY;
@@ -38,6 +38,7 @@ const CHUNK: usize = 256 << 10;
 const INVALID: u32 = u32::MAX;
 const NONE: u32 = u32::MAX;
 const NO_CATEGORY: u16 = u16::MAX;
+const PREFETCH: usize = 16;
 
 /// Chunk size; SS_CHUNK overrides it so tests can force many chunk boundaries.
 fn chunk_size() -> usize {
@@ -138,27 +139,7 @@ struct Ctx {
 }
 
 fn log(start: Instant, what: &str) {
-    let (u, k) = cpu_times();
-    eprintln!("[{:>8.3}s] {what}   (cpu so far: user {u:.3}s, kernel {k:.3}s)", start.elapsed().as_secs_f64());
-}
-
-/// Process user and kernel CPU seconds so far (all threads).
-fn cpu_times() -> (f64, f64) {
-    #[repr(C)]
-    struct Rusage {
-        utime: [i64; 2],
-        stime: [i64; 2],
-        rest: [i64; 14],
-    }
-    extern "C" {
-        fn getrusage(who: i32, usage: *mut Rusage) -> i32;
-    }
-    // SAFETY: getrusage(RUSAGE_SELF) fills the struct it is given.
-    unsafe {
-        let mut r: Rusage = std::mem::zeroed();
-        getrusage(0, &mut r);
-        (r.utime[0] as f64 + r.utime[1] as f64 / 1e6, r.stime[0] as f64 + r.stime[1] as f64 / 1e6)
-    }
+    eprintln!("[{:>8.3}s] {what}", start.elapsed().as_secs_f64());
 }
 
 /// Runs `work(state, task)` for tasks 0..n on `threads` threads, pulling tasks dynamically.
@@ -171,7 +152,6 @@ fn parallel<S: Send>(
     work: impl Fn(&mut S, usize) + Sync,
 ) -> Vec<S> {
     let next = AtomicUsize::new(0);
-    let (u0, s0) = cpu_times();
     let t0 = Instant::now();
     let results: Vec<(S, f64, f64, usize, f64)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
@@ -204,12 +184,9 @@ fn parallel<S: Send>(
     let busy: f64 = results.iter().map(|r| r.1).sum();
     let (longest, longest_task) = results.iter().map(|r| (r.2, r.3)).fold((0f64, 0), |a, b| if b.0 > a.0 { b } else { a });
     let slowest_start = results.iter().map(|r| r.4).fold(0f64, f64::max);
-    let (u1, s1) = cpu_times();
     eprintln!(
-        "  phase {name}: {n} tasks, wall {wall:.3}s, utilization {:.0}%, user {:.3}s, kernel {:.3}s, longest task #{longest_task} {longest:.3}s, slowest thread start {slowest_start:.3}s",
-        100.0 * busy / (threads as f64 * wall).max(1e-9),
-        u1 - u0,
-        s1 - s0
+        "  phase {name}: {n} tasks, wall {wall:.3}s, utilization {:.0}%, longest task #{longest_task} {longest:.3}s, slowest thread start {slowest_start:.3}s",
+        100.0 * busy / (threads as f64 * wall).max(1e-9)
     );
     results.into_iter().map(|r| r.0).collect()
 }
@@ -257,92 +234,89 @@ fn link_part(k: Key) -> usize {
 
 /// Person names for linked IDs that are not their person's name: one open-addressing table
 /// with key and name in the same slot (one cache miss per hit), behind a bitmap small enough to
-/// stay in cache that answers "not linked" for most other IDs without touching the table. Built
-/// by many threads at once (slots claimed with compare-and-swap); read with relaxed loads, which
-/// are plain loads on x86.
+/// stay in cache that answers "not linked" for most other IDs without touching the table.
 struct Persons {
-    slots: Vec<[AtomicU64; 2]>,
+    slots: Vec<[u64; 2]>,
     mask: usize,
-    filter: Vec<AtomicU64>,
+    filter: Vec<u64>,
     fmask: usize,
-    len: AtomicUsize,
+    len: usize,
 }
 
 impl Persons {
-    fn with_capacity(n: usize) -> Persons {
-        let cap = (2 * n).next_power_of_two().max(16);
-        let bits = (16 * n).next_power_of_two().max(1024);
-        Persons {
-            slots: (0..cap).map(|_| [AtomicU64::new(key::EMPTY), AtomicU64::new(0)]).collect(),
+    fn build(pairs: &[Vec<(Key, Key)>]) -> Persons {
+        let len: usize = pairs.iter().map(|p| p.len()).sum();
+        let cap = (2 * len).next_power_of_two().max(16);
+        let bits = (16 * len).next_power_of_two().max(1024);
+        let mut persons = Persons {
+            slots: vec![[key::EMPTY, 0]; cap],
             mask: cap - 1,
-            filter: (0..bits / 64).map(|_| AtomicU64::new(0)).collect(),
+            filter: vec![0; bits / 64],
             fmask: bits - 1,
-            len: AtomicUsize::new(0),
+            len,
+        };
+        for list in pairs {
+            for (i, &(k, name)) in list.iter().enumerate() {
+                if let Some(&(next, _)) = list.get(i + PREFETCH) {
+                    persons.prefetch_slot_always(next);
+                }
+                let h = key::hash(k);
+                let fb = (h >> 20) as usize & persons.fmask;
+                persons.filter[fb / 64] |= 1 << (fb % 64);
+                let mut at = h as usize & persons.mask;
+                while persons.slots[at][0] != key::EMPTY {
+                    at = (at + 1) & persons.mask;
+                }
+                persons.slots[at] = [k, name];
+            }
         }
+        persons
     }
 
-    /// Adds `k -> name`; safe to call from many threads at once (each key is added once).
     #[inline(always)]
-    fn insert(&self, k: Key, name: Key) {
+    fn get(&self, k: Key) -> Key {
         let h = key::hash(k);
         let fb = (h >> 20) as usize & self.fmask;
-        self.filter[fb / 64].fetch_or(1 << (fb % 64), Ordering::Relaxed);
-        let mut at = h as usize & self.mask;
-        loop {
-            let slot = &self.slots[at];
-            if slot[0].compare_exchange(key::EMPTY, k, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-                slot[1].store(name, Ordering::Relaxed);
-                self.len.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-            at = (at + 1) & self.mask;
+        if self.filter[fb / 64] >> (fb % 64) & 1 == 0 {
+            return k;
         }
-    }
-
-    /// The filter bit of a key with hash `h`: false means certainly not linked.
-    #[inline(always)]
-    fn maybe_linked(&self, h: u64) -> bool {
-        let fb = (h >> 20) as usize & self.fmask;
-        self.filter[fb / 64].load(Ordering::Relaxed) >> (fb % 64) & 1 != 0
-    }
-
-    /// The table lookup proper (the filter said the key may be linked).
-    #[inline(always)]
-    fn probe(&self, k: Key, h: u64) -> Key {
         let mut at = h as usize & self.mask;
         loop {
-            let s = &self.slots[at];
-            let found = s[0].load(Ordering::Relaxed);
-            if found == k {
-                return s[1].load(Ordering::Relaxed);
+            let s = self.slots[at];
+            if s[0] == k {
+                return s[1];
             }
-            if found == key::EMPTY {
+            if s[0] == key::EMPTY {
                 return k;
             }
             at = (at + 1) & self.mask;
         }
     }
 
-    /// First stage of a lookup pipeline: the filter word of the key with hash `h`.
+    /// First stage of a lookup pipeline: the filter word of `k`.
     #[inline(always)]
-    fn prefetch_filter(&self, h: u64) {
-        let fb = (h >> 20) as usize & self.fmask;
+    fn prefetch_filter(&self, k: Key) {
+        let fb = (key::hash(k) >> 20) as usize & self.fmask;
         prefetch(&self.filter[fb / 64]);
     }
 
-    /// Second stage: the table slot of the key with hash `h`, if the filter says it may be
-    /// linked. Returns that filter bit.
+    /// Second stage: the table slot of `k`, if the filter says it may be linked.
     #[inline(always)]
-    fn prefetch_slot(&self, h: u64) -> bool {
-        let maybe = self.maybe_linked(h);
-        if maybe {
+    fn prefetch_slot(&self, k: Key) {
+        let h = key::hash(k);
+        let fb = (h >> 20) as usize & self.fmask;
+        if self.filter[fb / 64] >> (fb % 64) & 1 != 0 {
             prefetch(&self.slots[h as usize & self.mask]);
         }
-        maybe
+    }
+
+    #[inline(always)]
+    fn prefetch_slot_always(&self, k: Key) {
+        prefetch(&self.slots[key::hash(k) as usize & self.mask]);
     }
 
     fn len(&self) -> usize {
-        self.len.load(Ordering::Relaxed)
+        self.len
     }
 }
 
@@ -362,55 +336,17 @@ struct PartIds {
     assign: Vec<(u32, u32)>, // (pair slot, local id)
 }
 
-/// Root of `x` in a union-find forest of atomic parent links, halving the path as it goes
-/// (a halving that loses a race to another thread is simply skipped).
-#[inline(always)]
-fn uf_find(parent: &[AtomicU32], mut x: u32) -> u32 {
-    loop {
-        let p = parent[x as usize].load(Ordering::Acquire);
-        if p == x {
-            return x;
-        }
-        let gp = parent[p as usize].load(Ordering::Acquire);
-        if gp != p {
-            let _ = parent[x as usize].compare_exchange_weak(p, gp, Ordering::AcqRel, Ordering::Relaxed);
-        }
-        x = gp;
-    }
-}
-
-/// Lock-free union: the root with the larger index is linked under the smaller one with a
-/// compare-and-swap, so concurrent unions can never form a cycle; a lost race retries.
-#[inline(always)]
-fn uf_union(parent: &[AtomicU32], a: u32, b: u32) {
-    let (mut a, mut b) = (a, b);
-    loop {
-        a = uf_find(parent, a);
-        b = uf_find(parent, b);
-        if a == b {
-            return;
-        }
-        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
-        if parent[hi as usize].compare_exchange(hi, lo, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
-            return;
-        }
-    }
-}
-
-/// Links -> person names, on the whole thread pool, with no serial step that grows with the data:
+/// Links -> person names, on the whole thread pool:
 ///   1. parse link files in parallel
-///   2. scatter (key, pair slot) into LINK_PARTS hash partitions (in ranges, for balance)
+///   2. scatter (key, pair slot) into LINK_PARTS hash partitions
 ///   3. per partition, in parallel: dense local IDs from a cache-sized map
-///   4. fill pair -> ID arrays (partitions own disjoint slots)
-///   5. lock-free union-find over all pairs in parallel
-///   6. each component's name is its byte-wise smallest key: atomic minimum over fast-form keys
-///      (whose integer order is byte order), then a serial pass for the rare interned keys
-///   7. the table from non-name IDs to names, filled by all threads at once
+///   4. serial union-find (by size, path halving) over plain u32 arrays
+///   5. each component's name is its byte-wise smallest key
+///   6. per partition, in parallel: the map from non-name IDs to names
 fn build_links(data: &Path, threads: usize) -> Persons {
-    const RANGE: usize = 32 * 1024;
     let t0 = Instant::now();
     let input = csv::Input::open(&csv::list_csv(&data.join("links")));
-    let chunks = input.chunks(chunk_size().min(256 << 10));
+    let chunks = input.chunks(chunk_size().min(1 << 20));
     struct LinkState {
         buf: Vec<u8>,
         pairs: Vec<(Key, Key)>,
@@ -433,26 +369,20 @@ fn build_links(data: &Path, threads: usize) -> Persons {
     let lists: Vec<Vec<(Key, Key)>> = parsed.into_iter().map(|s| s.pairs).collect();
     let mut offsets = Vec::with_capacity(lists.len());
     let mut total = 0usize;
-    let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
-    for (li, l) in lists.iter().enumerate() {
+    for l in &lists {
         offsets.push(total);
         total += l.len();
-        for s in (0..l.len()).step_by(RANGE) {
-            ranges.push((li, s, (s + RANGE).min(l.len())));
-        }
     }
     assert!(2 * total < u32::MAX as usize, "too many links");
 
     let scattered = parallel(
         "links-scatter",
         threads,
-        ranges.len(),
+        lists.len(),
         || (0..LINK_PARTS).map(|_| Vec::<(Key, u32)>::new()).collect::<Vec<_>>(),
-        |parts, task| {
-            let (li, s, e) = ranges[task];
+        |parts, li| {
             let base = 2 * offsets[li];
-            for i in s..e {
-                let (a, b) = lists[li][i];
+            for (i, &(a, b)) in lists[li].iter().enumerate() {
                 parts[link_part(a)].push((a, (base + 2 * i) as u32));
                 parts[link_part(b)].push((b, (base + 2 * i + 1) as u32));
             }
@@ -510,59 +440,52 @@ fn build_links(data: &Path, threads: usize) -> Persons {
     drop(parts);
     let t_fill = t0.elapsed().as_secs_f64();
 
-    // Union-find, lock-free, over all pairs in parallel.
-    let parent: Vec<AtomicU32> = (0..n_ids as u32).map(AtomicU32::new).collect();
-    let pair_tasks = total.div_ceil(RANGE).max(1);
-    parallel("links-union", threads, pair_tasks, || (), |_, t| {
-        let (s, e) = (t * RANGE, ((t + 1) * RANGE).min(total));
-        for i in s..e {
-            uf_union(&parent, slot_id[2 * i], slot_id[2 * i + 1]);
+    // The only serial step: union by size with path halving; parent and size share a cache
+    // line, and each root keeps its component's byte-wise smallest key as it goes.
+    let mut node: Vec<[u32; 2]> = (0..n_ids as u32).map(|i| [i, 1]).collect();
+    let mut name: Vec<Key> = keys.clone();
+    #[inline(always)]
+    fn find(node: &mut [[u32; 2]], mut x: u32) -> u32 {
+        while node[x as usize][0] != x {
+            let up = node[node[x as usize][0] as usize][0];
+            node[x as usize][0] = up;
+            x = up;
         }
-    });
-    drop(slot_id);
-    let t_union = t0.elapsed().as_secs_f64();
-
-    // Roots and names. Fast-form keys compare as integers, so the minimum is an atomic
-    // fetch_min; interned keys (rare) are collected and compared by bytes afterwards.
-    let id_tasks = n_ids.div_ceil(RANGE).max(1);
-    let root: Vec<AtomicU32> = (0..n_ids).map(|_| AtomicU32::new(0)).collect();
-    let name: Vec<AtomicU64> = (0..n_ids).map(|_| AtomicU64::new(u64::MAX)).collect();
-    let slow = parallel("links-roots", threads, id_tasks, Vec::new, |slow: &mut Vec<(u32, Key)>, t| {
-        let (s, e) = (t * RANGE, ((t + 1) * RANGE).min(n_ids));
-        for i in s..e {
-            let r = uf_find(&parent, i as u32);
-            root[i].store(r, Ordering::Relaxed);
-            let k = keys[i];
-            if key::is_slow(k) {
-                slow.push((r, k));
-            } else {
-                name[r as usize].fetch_min(k, Ordering::Relaxed);
-            }
-        }
-    });
-    for list in slow {
-        for (r, k) in list {
-            let cur = name[r as usize].load(Ordering::Relaxed);
-            if cur == u64::MAX || key::cmp(k, cur).is_lt() {
-                name[r as usize].store(k, Ordering::Relaxed);
+        x
+    }
+    for pair in slot_id.chunks_exact(2) {
+        let ra = find(&mut node, pair[0]);
+        let rb = find(&mut node, pair[1]);
+        if ra != rb {
+            let (big, small) = if node[ra as usize][1] >= node[rb as usize][1] { (ra, rb) } else { (rb, ra) };
+            node[small as usize][0] = big;
+            node[big as usize][1] += node[small as usize][1];
+            if key::cmp(name[small as usize], name[big as usize]).is_lt() {
+                name[big as usize] = name[small as usize];
             }
         }
     }
-    drop(parent);
+    drop(slot_id);
+    let t_union = t0.elapsed().as_secs_f64();
 
-    // The table from non-name IDs to names, by all threads at once.
-    let persons = Persons::with_capacity(n_ids);
-    parallel("links-names", threads, id_tasks, || (), |_, t| {
-        let (s, e) = (t * RANGE, ((t + 1) * RANGE).min(n_ids));
-        for i in s..e {
-            let nm = name[root[i].load(Ordering::Relaxed) as usize].load(Ordering::Relaxed);
-            if nm != keys[i] {
-                persons.insert(keys[i], nm);
+    // Roots by read-only walks (trees are shallow after union by size), fused with building
+    // each partition's map from non-name IDs to names.
+    let pair_lists = parallel("links-names", threads, LINK_PARTS, Vec::new, |out: &mut Vec<(Key, Key)>, p| {
+        let (lo, hi) = (base[p] as usize, base[p + 1] as usize);
+        for id in lo..hi {
+            let mut r = id as u32;
+            while node[r as usize][0] != r {
+                r = node[r as usize][0];
+            }
+            let nm = name[r as usize];
+            if nm != keys[id] {
+                out.push((keys[id], nm));
             }
         }
     });
+    let persons = Persons::build(&pair_lists);
     eprintln!(
-        "  links: {total} pairs, {n_ids} ids; ids {t_ids:.3}s, fill {:.3}s, union-find (parallel) {:.3}s, names {:.3}s",
+        "  links: {total} pairs, {n_ids} ids; ids {t_ids:.3}s, fill {:.3}s, union-find (serial) {:.3}s, name maps {:.3}s",
         t_fill - t_ids,
         t_union - t_fill,
         t0.elapsed().as_secs_f64() - t_union
@@ -901,20 +824,13 @@ fn regroup<B: Bucket>(per_thread: Vec<Vec<B>>, n: usize) -> Vec<Mutex<Vec<B>>> {
     slots.into_iter().map(Mutex::new).collect()
 }
 
-/// Counting-sort scatter of several pieces into `nb` bins, keeping the records `keep` accepts
-/// and storing `map` of each: returns the binned values and the start of each bin (nb + 1
-/// offsets). Reads each piece in place, so no concatenation copy.
-fn bin_scatter<T, U>(
-    pieces: &[&[T]],
-    nb: usize,
-    bin: impl Fn(&T) -> usize,
-    keep: impl Fn(&T) -> bool,
-    map: impl Fn(&T) -> U,
-) -> (Vec<U>, Vec<usize>) {
+/// Counting-sort scatter of several pieces into `nb` bins: returns the binned records and the
+/// start of each bin (nb + 1 offsets). Reads each piece in place, so no concatenation copy.
+fn bin_scatter<T: Copy>(pieces: &[&[T]], nb: usize, bin: impl Fn(&T) -> usize) -> (Vec<T>, Vec<usize>) {
     let mut at = vec![0usize; nb + 1];
     for piece in pieces {
         for x in piece.iter() {
-            at[bin(x) + 1] += keep(x) as usize;
+            at[bin(x) + 1] += 1;
         }
     }
     for b in 0..nb {
@@ -922,20 +838,17 @@ fn bin_scatter<T, U>(
     }
     // Every slot is written exactly once (the counts are the writes), so no zero-fill first.
     let n = at[nb];
-    let mut out: Vec<U> = Vec::with_capacity(n);
+    let mut out: Vec<T> = Vec::with_capacity(n);
     let spare = out.spare_capacity_mut();
     let mut next = at.clone();
     for piece in pieces {
         for x in piece.iter() {
-            if keep(x) {
-                let b = bin(x);
-                spare[next[b]].write(map(x));
-                next[b] += 1;
-            }
+            let b = bin(x);
+            spare[next[b]].write(*x);
+            next[b] += 1;
         }
     }
-    // SAFETY: the counting pass sized each bin exactly with the same `keep` and `bin`, so all n
-    // slots were written above.
+    // SAFETY: the counting pass sized each bin exactly, so all n slots were written above.
     unsafe { out.set_len(n) };
     (out, at)
 }
@@ -944,44 +857,16 @@ fn slot_len<B: Bucket>(slot: &Mutex<Vec<B>>) -> usize {
     slot.lock().unwrap().iter().map(|p| p.count()).sum()
 }
 
-/// Allocates and touches about SS_PREFAULT (default 0.75) bytes per byte of event and click
-/// input, then frees it, so the allocator holds that much already-faulted memory.
-fn prefault(data: &Path) {
-    let t = Instant::now();
-    let ratio: f64 = std::env::var("SS_PREFAULT").ok().and_then(|v| v.parse().ok()).unwrap_or(0.75);
-    let input: u64 = ["events", "clicks"]
-        .iter()
-        .flat_map(|d| csv::list_csv(&data.join(d)))
-        .filter_map(|p| std::fs::metadata(p).ok())
-        .map(|m| m.len())
-        .sum();
-    let bytes = (input as f64 * ratio) as usize;
-    if bytes < (64 << 20) {
-        return;
-    }
-    // Several blocks rather than one, so the freed memory is reused by ordinary-sized allocations.
-    const BLOCK: usize = 64 << 20;
-    let mut blocks: Vec<Vec<u8>> = Vec::with_capacity(bytes / BLOCK + 1);
-    for _ in 0..bytes / BLOCK {
-        let mut b: Vec<u8> = Vec::with_capacity(BLOCK);
-        let p = b.as_mut_ptr();
-        for at in (0..BLOCK).step_by(4096) {
-            // SAFETY: within the allocation; a volatile write so the touch is not optimized out.
-            unsafe { std::ptr::write_volatile(p.add(at), 0) };
-        }
-        blocks.push(b);
-    }
-    drop(blocks);
-    eprintln!("  prefault: {} MB in {:.3}s", bytes >> 20, t.elapsed().as_secs_f64());
-}
-
-/// Single-threaded micro-benchmarks of the event parse path (SS_BENCH=lines|split|event).
+/// Single-threaded micro-benchmarks of the event parse path (SS_BENCH=lines|split|event|push).
 fn bench(ctx: &Ctx, data: &Path, mode: &str) {
     let input = csv::Input::open(&csv::list_csv(&data.join("events")));
     let chunks = input.chunks(chunk_size());
     let t = Instant::now();
     let mut n = 0u64;
     let mut buf = Vec::new();
+    let np = 2048;
+    let mut buckets: scatter::Scatter<DedupRec, 4> = scatter::Scatter::new(np, input.bytes() / 56 / np + 64);
+    let mut payload: Vec<Pay> = Vec::with_capacity(input.bytes() / 56 + 64);
     for &c in &chunks {
         if mode == "lines" {
             input.lines(c, &mut buf, |line| n += line.len() as u64);
@@ -989,159 +874,73 @@ fn bench(ctx: &Ctx, data: &Path, mode: &str) {
         }
         input.records::<7>(c, &mut buf, |f| match mode {
             "split" => n += 1,
-            _ => n += parse_event(ctx, f).is_some() as u64,
+            "event" => n += parse_event(ctx, f).is_some() as u64,
+            _ => {
+                if let Some(rec) = parse_event(ctx, f) {
+                    push_event(&rec, 0, &mut payload, &mut buckets, np);
+                    n += 1;
+                }
+            }
         });
     }
     let secs = t.elapsed().as_secs_f64();
     eprintln!("bench {mode}: {n} in {secs:.3}s = {:.0} MB/s", input.bytes() as f64 / secs / 1e6);
 }
 
-/// What dedup needs of an event copy: its ID, its ingest time, and which valid copy it is
+/// What dedup needs of an event copy: its ID, its ingest time, and where its payload is
 /// (`NOREF` for a copy that fails validation: it competes in dedup but has nothing to keep).
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 struct DedupRec {
     eid: Key,
     ingest: u32,
-    pref: u32, // thread << REF_BITS | that thread's count of valid copies before this one
+    pref: u32, // thread << REF_BITS | index into that thread's payload
 }
 
-/// A valid event copy, in its person's bucket: 16 bytes, four to a cache line. `tseq` is its
-/// DedupRec's `pref`, so the sessions phase can drop the copies that lost dedup. A purchase has
-/// PURCHASE set in `ts`; its price and category are then in the parsing thread's `pcs[seq]`.
-#[derive(Clone, Copy, Default)]
+/// What a valid event copy contributes if it is its event's kept copy.
+#[derive(Clone, Copy)]
 #[repr(C)]
-struct PEv {
-    person: Key,
+struct Pay {
+    user: Key,
     ts: u32,
-    tseq: u32,
+    pc: u32,
 }
-
-/// Flag in PEv::ts (window offsets are below 2^31 ms, about 24.8 days).
-const PURCHASE: u32 = 1 << 31;
 
 const NOREF: u32 = u32::MAX;
 const REF_BITS: u32 = 26; // up to 64 threads and 67M valid events per thread
 const MAX_THREADS: usize = 1 << (32 - REF_BITS);
 
-/// A parsed valid event waiting for its person lookup.
-#[derive(Clone, Copy, Default)]
-struct EvPending {
-    user: Key,
-    h: u64, // hash(user), computed once
-    ts: u32,
-    pc: u32,
-    tseq: u32,
-}
-
-trait HasUser {
-    fn user(&self) -> Key;
-    fn user_hash(&self) -> u64;
-}
-
-impl HasUser for EvPending {
-    #[inline(always)]
-    fn user(&self) -> Key {
-        self.user
-    }
-    #[inline(always)]
-    fn user_hash(&self) -> u64 {
-        self.h
-    }
-}
-
-impl HasUser for ClickRec {
-    #[inline(always)]
-    fn user(&self) -> Key {
-        self.person // a parsed click holds its user ID here until the lookup
-    }
-    #[inline(always)]
-    fn user_hash(&self) -> u64 {
-        self._pad // ... and the ID's hash here
-    }
-}
-
-const RING: usize = 8;
-
-/// A software pipeline for person lookups, run on the parsing threads. A record waits RING
-/// records between the start of its lookup and its completion, so the lookup's memory latency
-/// overlaps the parsing of the records after it instead of stalling a separate phase:
-///   enter:   prefetch the membership-filter word (the user's hash was computed once, at parse)
-///   halfway: read the filter bit (now cached); if set, prefetch the table slot
-///   leave:   most users are not linked (filter bit clear): their person is themselves and their
-///            bucket comes from the same hash; only the others probe the (prefetched) table.
-/// `done` gets the record, its person and the person's hash.
-struct Ring<T: Copy + Default + HasUser> {
-    items: [T; RING],
-    maybe: [bool; RING],
-    n: usize,
-}
-
-impl<T: Copy + Default + HasUser> Ring<T> {
-    fn new() -> Self {
-        Ring { items: [T::default(); RING], maybe: [false; RING], n: 0 }
-    }
-
-    #[inline(always)]
-    fn resolve(persons: &Persons, x: &T, maybe: bool) -> (Key, u64) {
-        let (user, h) = (x.user(), x.user_hash());
-        if !maybe {
-            return (user, h);
-        }
-        let person = persons.probe(user, h);
-        (person, if person == user { h } else { key::hash(person) })
-    }
-
-    #[inline(always)]
-    fn push(&mut self, persons: &Persons, x: T, mut done: impl FnMut(T, Key, u64)) {
-        persons.prefetch_filter(x.user_hash());
-        if self.n >= RING / 2 {
-            let mid = (self.n - RING / 2) % RING;
-            self.maybe[mid] = persons.prefetch_slot(self.items[mid].user_hash());
-        }
-        if self.n >= RING {
-            let at = self.n % RING;
-            let old = self.items[at];
-            let (person, ph) = Self::resolve(persons, &old, self.maybe[at]);
-            done(old, person, ph);
-        }
-        self.items[self.n % RING] = x;
-        self.n += 1;
-    }
-
-    fn flush(&mut self, persons: &Persons, mut done: impl FnMut(T, Key, u64)) {
-        for i in self.n.saturating_sub(RING)..self.n {
-            let old = self.items[i % RING];
-            // The newest records never reached the halfway step: check their filter bit now.
-            let maybe = persons.maybe_linked(old.user_hash());
-            let (person, ph) = Self::resolve(persons, &old, maybe);
-            done(old, person, ph);
-        }
-        self.n = 0;
-    }
-}
-
-/// The bucket of a key with hash `h` (the same bits `bucket` uses).
+/// Stores a parsed copy: the payload goes to this thread's sequential array, and a 16-byte
+/// record goes to the event-id bucket.
 #[inline(always)]
-fn bucket_h(h: u64, n: usize) -> usize {
-    ((h >> 40) as usize) % n
+fn push_event(rec: &EvRec, thread: usize, payload: &mut Vec<Pay>, buckets: &mut scatter::Scatter<DedupRec, 4>, np: usize) {
+    let pref = if rec.ts == INVALID {
+        NOREF
+    } else {
+        let at = payload.len();
+        assert!(at < (1 << REF_BITS) - 1, "too many events on one thread for a 26-bit reference");
+        payload.push(Pay { user: rec.user, ts: rec.ts, pc: rec.pc });
+        (thread as u32) << REF_BITS | at as u32
+    };
+    buckets.push(bucket(rec.eid, np), DedupRec { eid: rec.eid, ingest: rec.ingest, pref });
 }
 
 struct ParseState {
     thread: usize,
     buf: Vec<u8>,
     events: scatter::Scatter<DedupRec, 4>,
-    sess: scatter::Scatter<PEv, 4>,
-    pcs: Vec<u32>, // price << 8 | category of this thread's valid copies, by sequence number
-    clicks: scatter::Scatter<ClickRec, 2>,
-    nseq: usize,
-    ev_ring: Ring<EvPending>,
-    ck_ring: Ring<ClickRec>,
+    payload: Vec<Pay>,
+    clicks: Vec<ClickRec>,
 }
 
 struct DedupState {
     table: Vec<DedupRec>,
     used: Vec<u32>,
+}
+
+struct RegroupState {
+    sess: scatter::Scatter<u128, 4>,
+    clicks: scatter::Scatter<ClickRec, 2>,
 }
 
 fn main() {
@@ -1155,135 +954,84 @@ fn main() {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from))
         .clamp(1, MAX_THREADS);
 
-    // ---- links on the whole pool (parsing needs them: events and clicks go straight to their
-    // person's bucket), while one more thread loads the lookups and plans the input chunks
-    let ((ctx, events_in, clicks_in, ev_chunks, ck_chunks), persons) = std::thread::scope(|scope| {
-        // Fault in the memory the parse phase will fill, from one thread, while links run. Page
-        // faults from many threads at once contend in the kernel (kernel time grew 2.5 s -> 9.6 s
-        // from 1 to 8 threads); one thread faulting does not. With purging off, the allocator
-        // hands these already-mapped pages out again after they are freed.
-        scope.spawn(|| prefault(&data));
-        let setup = scope.spawn(|| {
-            let ctx = load_context(&data, start);
-            let events_in = csv::Input::open(&csv::list_csv(&data.join("events")));
-            let clicks_in = csv::Input::open(&csv::list_csv(&data.join("clicks")));
-            let ev_chunks = events_in.chunks(chunk_size());
-            let ck_chunks = clicks_in.chunks(chunk_size());
-            (ctx, events_in, clicks_in, ev_chunks, ck_chunks)
-        });
-        let persons = build_links(&data, threads);
-        log(start, &format!("links: {} non-name IDs mapped", persons.len()));
-        (setup.join().expect("setup thread panicked"), persons)
-    });
-    log(start, "setup joined");
+    let ctx = load_context(&data, start);
     if let Ok(mode) = std::env::var("SS_BENCH") {
         bench(&ctx, &data, &mode);
         return;
     }
+    let events_in = csv::Input::open(&csv::list_csv(&data.join("events")));
+    let clicks_in = csv::Input::open(&csv::list_csv(&data.join("clicks")));
+    let ev_chunks = events_in.chunks(chunk_size());
+    let ck_chunks = clicks_in.chunks(chunk_size());
 
-    // Bucket counts. Parsing writes into every bucket at once through one staging line per
-    // bucket, so the fanout is capped to keep those lines in cache: measured at 8 threads,
-    // 4096/2048 buckets ran 19% slower than 1024/512. Within that cap, buckets are sized so a
-    // dedup table (event-id) or a sessions task (person) stays small.
+    // Event-id buckets small enough that a bucket's dedup table stays in L2.
     let np: usize = std::env::var("SS_NP")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or((events_in.bytes() / 76 / 8192).next_power_of_two().clamp(64, 1024))
-        .clamp(64, 4096);
-    let nq: usize = std::env::var("SS_NQ")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or((events_in.bytes() / 76 / 16384).next_power_of_two().clamp(64, 512))
+        .unwrap_or((events_in.bytes() / 76 / 8192).next_power_of_two())
         .clamp(64, 4096);
     // Capacities with headroom: a doubling copy of a big array costs far more than slack.
     let ev_estimate = events_in.bytes() / 56 / np / threads + 64;
-    let sess_estimate = events_in.bytes() / 56 / nq / threads + 64;
-    let ck_estimate = clicks_in.bytes() / 30 / nq / threads + 64;
-    let pcs_estimate = events_in.bytes() / 56 / threads + 64;
-    assert!(ctx.we - ctx.ws < PURCHASE as i64, "window too long for 31-bit time offsets");
+    let pay_estimate = events_in.bytes() / 56 / threads + 64;
+    let ck_estimate = clicks_in.bytes() / 30 / threads + 64;
     let n_tasks = ev_chunks.len() + ck_chunks.len();
 
-    // ---- parse: each event copy goes to its event-id bucket (for dedup) and, if valid, to its
-    // person's bucket; each click to its person's bucket. Person lookups run in a prefetch ring.
+    // ---- parse events and clicks on the pool; links (which parsing does not need) alongside
     let thread_ids = AtomicUsize::new(0);
-    let parsed = parallel(
-        "parse",
-        threads,
-        n_tasks,
-        || ParseState {
-            thread: thread_ids.fetch_add(1, Ordering::Relaxed),
-            buf: Vec::new(),
-            events: scatter::Scatter::new(np, ev_estimate),
-            sess: scatter::Scatter::new(nq, sess_estimate),
-            pcs: Vec::with_capacity(pcs_estimate),
-            clicks: scatter::Scatter::new(nq, ck_estimate),
-            nseq: 0,
-            ev_ring: Ring::new(),
-            ck_ring: Ring::new(),
-        },
-        |st, task| {
-            let ParseState { thread, buf, events, sess, pcs, clicks, nseq, ev_ring, ck_ring } = st;
-            let thread = *thread as u32;
-            let mut to_bucket = |x: EvPending, person: Key, ph: u64| {
-                let flag = if x.pc != 0 { PURCHASE } else { 0 };
-                sess.push(bucket_h(ph, nq), PEv { person, ts: x.ts | flag, tseq: x.tseq });
-            };
-            if task < ev_chunks.len() {
-                events_in.records::<7>(ev_chunks[task], buf, |f| {
-                    if let Some(rec) = parse_event(&ctx, f) {
-                        let pref = if rec.ts == INVALID {
-                            NOREF
-                        } else {
-                            assert!(*nseq < (1 << REF_BITS) - 1, "too many events on one thread for a 26-bit reference");
-                            let pref = thread << REF_BITS | *nseq as u32;
-                            *nseq += 1;
-                            pcs.push(rec.pc);
-                            let pending = EvPending { user: rec.user, h: key::hash(rec.user), ts: rec.ts, pc: rec.pc, tseq: pref };
-                            ev_ring.push(&persons, pending, &mut to_bucket);
-                            pref
-                        };
-                        events.push(bucket(rec.eid, np), DedupRec { eid: rec.eid, ingest: rec.ingest, pref });
-                    }
-                });
-                ev_ring.flush(&persons, &mut to_bucket);
-            } else {
-                let mut click_to_bucket = |mut c: ClickRec, person: Key, ph: u64| {
-                    c.person = person;
-                    c._pad = 0;
-                    clicks.push(bucket_h(ph, nq), c);
-                };
-                clicks_in.records::<4>(ck_chunks[task - ev_chunks.len()], buf, |f| {
-                    if let Some(mut rec) = parse_click(&ctx, f) {
-                        rec._pad = key::hash(rec.person); // the user's hash, for the lookup ring
-                        ck_ring.push(&persons, rec, &mut click_to_bucket);
-                    }
-                });
-                ck_ring.flush(&persons, &mut click_to_bucket);
-            }
-        },
-    );
-    log(start, &format!("parsed {} MB events, {} MB clicks", events_in.bytes() >> 20, clicks_in.bytes() >> 20));
+    let (parsed, persons) = std::thread::scope(|scope| {
+        let links = scope.spawn(|| {
+            let persons = build_links(&data, threads.min(2));
+            log(start, &format!("links: {} non-name IDs mapped", persons.len()));
+            persons
+        });
+        let parsed = parallel(
+            "parse",
+            threads,
+            n_tasks,
+            || ParseState {
+                thread: thread_ids.fetch_add(1, Ordering::Relaxed),
+                buf: Vec::new(),
+                events: scatter::Scatter::new(np, ev_estimate),
+                payload: Vec::with_capacity(pay_estimate),
+                clicks: Vec::with_capacity(ck_estimate),
+            },
+            |st, task| {
+                let ParseState { thread, buf, events, payload, clicks } = st;
+                if task < ev_chunks.len() {
+                    events_in.records::<7>(ev_chunks[task], buf, |f| {
+                        if let Some(rec) = parse_event(&ctx, f) {
+                            push_event(&rec, *thread, payload, events, np);
+                        }
+                    });
+                } else {
+                    clicks_in.records::<4>(ck_chunks[task - ev_chunks.len()], buf, |f| {
+                        if let Some(rec) = parse_click(&ctx, f) {
+                            clicks.push(rec);
+                        }
+                    });
+                }
+            },
+        );
+        log(start, &format!("parsed {} MB events, {} MB clicks", events_in.bytes() >> 20, clicks_in.bytes() >> 20));
+        (parsed, links.join().expect("links thread panicked"))
+    });
+    log(start, "links joined");
     let mut ev_threads = Vec::with_capacity(parsed.len());
-    let mut sess_threads = Vec::with_capacity(parsed.len());
-    let mut ck_threads = Vec::with_capacity(parsed.len());
-    let mut valid = vec![0usize; threads];
-    let mut pcs: Vec<Vec<u32>> = (0..threads).map(|_| Vec::new()).collect();
+    let mut payloads: Vec<Vec<Pay>> = (0..threads).map(|_| Vec::new()).collect();
+    let mut ck_lists = Vec::with_capacity(parsed.len());
     for st in parsed {
-        valid[st.thread] = st.nseq;
-        pcs[st.thread] = st.pcs;
         ev_threads.push(st.events.finish());
-        sess_threads.push(st.sess.finish());
-        ck_threads.push(st.clicks.finish());
+        payloads[st.thread] = st.payload;
+        ck_lists.push(st.clicks);
     }
     let ev_slots = regroup(ev_threads, np);
-    let sess_slots = regroup(sess_threads, nq);
-    let ck_slots = regroup(ck_threads, nq);
-    // One bit per valid copy, set when that copy lost its event's dedup.
-    let losers: Vec<Vec<AtomicU64>> = valid.iter().map(|&n| (0..n / 64 + 1).map(|_| AtomicU64::new(0)).collect()).collect();
+    // One bit per payload entry, set when that copy lost its event's dedup.
+    let losers: Vec<Vec<AtomicU64>> =
+        payloads.iter().map(|p| (0..p.len() / 64 + 1).map(|_| AtomicU64::new(0)).collect()).collect();
 
     // ---- dedup on event_id: per bucket, the copy with the smallest ingest_ts is kept and every
-    // other valid copy is marked a loser. Duplicates are a few percent of rows, so this phase
-    // only reads 16-byte records and probes a small table.
+    // other copy that has a payload is marked a loser. Duplicates are a few percent of rows, so
+    // this phase only reads 16-byte records and probes a small table.
     let deduped = parallel(
         "dedup",
         threads,
@@ -1331,17 +1079,93 @@ fn main() {
                 st.table[slot as usize].eid = key::EMPTY;
             }
             st.used.clear();
-            // Freed here, the bucket's memory is reused by the sessions phase (no new pages).
-            drop(owned);
+            // The process ends soon: freeing a bucket would only make the allocator purge it.
+            std::mem::forget(owned);
         },
     );
     drop(deduped);
     drop(ev_slots);
     log(start, "deduplicated events");
-    let lost = |x: &PEv| {
-        let at = (x.tseq & ((1 << REF_BITS) - 1)) as usize;
-        losers[(x.tseq >> REF_BITS) as usize][at / 64].load(Ordering::Relaxed) >> (at % 64) & 1 != 0
-    };
+
+    // ---- map users to persons and bucket by person: kept events (sequential over each
+    // thread's payload) and clicks, both cut into small ranges so no task is a straggler
+    const RANGE: usize = 32 * 1024;
+    let mut ranges: Vec<(bool, usize, usize, usize)> = Vec::new();
+    for (li, list) in ck_lists.iter().enumerate() {
+        for s in (0..list.len()).step_by(RANGE) {
+            ranges.push((true, li, s, (s + RANGE).min(list.len())));
+        }
+    }
+    for (t, pay) in payloads.iter().enumerate() {
+        for s in (0..pay.len()).step_by(RANGE) {
+            ranges.push((false, t, s, (s + RANGE).min(pay.len())));
+        }
+    }
+    // Person buckets small enough that a bucket's events, clicks and their sorted copies stay
+    // in L2 during the sessions phase.
+    let nq: usize = std::env::var("SS_NQ")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or((events_in.bytes() / 76 / 16384).next_power_of_two())
+        .clamp(64, 4096);
+    let sess_estimate = events_in.bytes() / 56 / nq / threads + 64;
+    let ck_bucket_estimate = clicks_in.bytes() / 30 / nq / threads + 64;
+    let regrouped = parallel(
+        "regroup",
+        threads,
+        ranges.len(),
+        || RegroupState {
+            sess: scatter::Scatter::new(nq, sess_estimate),
+            clicks: scatter::Scatter::new(nq, ck_bucket_estimate),
+        },
+        |st, task| {
+            let (is_click, li, s, e) = ranges[task];
+            if is_click {
+                let list = &ck_lists[li][s..e];
+                for i in 0..list.len() {
+                    if let Some(next) = list.get(i + 2 * PREFETCH) {
+                        persons.prefetch_filter(next.person);
+                    }
+                    if let Some(next) = list.get(i + PREFETCH) {
+                        persons.prefetch_slot(next.person);
+                    }
+                    let mut c = list[i];
+                    let person = persons.get(c.person);
+                    c.person = person;
+                    st.clicks.push(bucket(person, nq), c);
+                }
+                return;
+            }
+            let pay = &payloads[li][s..e];
+            let lost = &losers[li];
+            for i in 0..pay.len() {
+                if let Some(next) = pay.get(i + 2 * PREFETCH) {
+                    persons.prefetch_filter(next.user);
+                }
+                if let Some(next) = pay.get(i + PREFETCH) {
+                    persons.prefetch_slot(next.user);
+                }
+                let g = s + i;
+                if lost[g / 64].load(Ordering::Relaxed) >> (g % 64) & 1 != 0 {
+                    continue;
+                }
+                let p = pay[i];
+                let person = persons.get(p.user);
+                st.sess.push(bucket(person, nq), (person as u128) << 64 | (p.ts as u128) << 32 | p.pc as u128);
+            }
+        },
+    );
+    std::mem::forget(payloads);
+    std::mem::forget(ck_lists);
+    let mut sess_threads = Vec::with_capacity(regrouped.len());
+    let mut ck_threads = Vec::with_capacity(regrouped.len());
+    for st in regrouped {
+        sess_threads.push(st.sess.finish());
+        ck_threads.push(st.clicks.finish());
+    }
+    let sess_slots = regroup(sess_threads, nq);
+    let ck_slots = regroup(ck_threads, nq);
+    log(start, "regrouped by person");
 
     // ---- sessions, attribution, aggregation per person bucket, largest first
     let mut order: Vec<usize> = (0..nq).collect();
@@ -1369,20 +1193,12 @@ fn main() {
             let n_ev: usize = ev_pieces.iter().map(|p| p.len()).sum();
             // Bin by bits of hash(person) that `bucket` does not use: a person's events and
             // clicks share a bin, and a bin holds only a few persons, so sorting it is cheap.
-            // Copies that lost dedup are dropped on the way in.
             let nb = (n_ev / 8).next_power_of_two().clamp(16, 1 << 16);
             let bin = |p: Key| ((key::hash(p) >> 16) as usize) & (nb - 1);
-            let ev_slices: Vec<&[PEv]> = ev_pieces.iter().map(|p| p.as_slice()).collect();
+            let ev_slices: Vec<&[u128]> = ev_pieces.iter().map(|p| p.as_slice()).collect();
             let ck_slices: Vec<&[ClickRec]> = ck_pieces.iter().map(|p| p.as_slice()).collect();
-            let (mut evs, ev_at) = bin_scatter(&ev_slices, nb, |x: &PEv| bin(x.person), |x: &PEv| !lost(x), |x: &PEv| {
-                let pc = if x.ts & PURCHASE != 0 {
-                    pcs[(x.tseq >> REF_BITS) as usize][(x.tseq & ((1 << REF_BITS) - 1)) as usize]
-                } else {
-                    0
-                };
-                (x.person as u128) << 64 | ((x.ts & !PURCHASE) as u128) << 32 | pc as u128
-            });
-            let (mut cks, ck_at) = bin_scatter(&ck_slices, nb, |c: &ClickRec| bin(c.person), |_| true, |c: &ClickRec| *c);
+            let (mut evs, ev_at) = bin_scatter(&ev_slices, nb, |x: &u128| bin((x >> 64) as u64));
+            let (mut cks, ck_at) = bin_scatter(&ck_slices, nb, |c: &ClickRec| bin(c.person));
             drop(ev_slices);
             drop(ck_slices);
             drop(ev_pieces);

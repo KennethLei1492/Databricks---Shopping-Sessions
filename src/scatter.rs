@@ -7,7 +7,7 @@
 
 use std::mem::{align_of, size_of};
 
-/// K records filling a whole number of cache lines (64 bytes each).
+/// One cache line of K records.
 #[derive(Clone, Copy)]
 #[repr(C, align(64))]
 pub struct Line<T: Copy, const K: usize>([T; K]);
@@ -20,10 +20,9 @@ pub struct Lines<T: Copy, const K: usize> {
 
 impl<T: Copy, const K: usize> Lines<T, K> {
     pub fn as_slice(&self) -> &[T] {
-        // SAFETY: Line is repr(C) of [T; K] whose size is a multiple of 64 (checked in
-        // Scatter::new), so it has no padding and the lines are a contiguous [T] of
-        // lines.len() * K records, of which the first `len` are initialized values (the rest are
-        // zeros or older values of T).
+        // SAFETY: Line is repr(C) of [T; K] with size 64 = K * size_of::<T>() (checked in
+        // Scatter::new), so the lines are a contiguous [T] of lines.len() * K records, of which
+        // the first `len` are initialized values (the rest are zeros or older values of T).
         unsafe { std::slice::from_raw_parts(self.lines.as_ptr() as *const T, self.len) }
     }
 
@@ -41,7 +40,7 @@ pub struct Scatter<T: Copy, const K: usize> {
 impl<T: Copy + Default, const K: usize> Scatter<T, K> {
     /// `n` buckets with room for about `per_bucket` records each before any reallocation.
     pub fn new(n: usize, per_bucket: usize) -> Self {
-        const { assert!(size_of::<[T; K]>() % 64 == 0 && K <= 255 && align_of::<T>() <= 64) };
+        const { assert!(size_of::<[T; K]>() == 64 && align_of::<T>() <= 64) };
         let lines = per_bucket.div_ceil(K);
         Scatter {
             buckets: (0..n).map(|_| Lines { lines: Vec::with_capacity(lines), len: 0 }).collect(),
@@ -60,13 +59,10 @@ impl<T: Copy + Default, const K: usize> Scatter<T, K> {
             let bucket = &mut self.buckets[b];
             bucket.lines.reserve(1);
             // SAFETY: capacity for one more line was reserved; the destination is 64-byte aligned
-            // (Line is align(64)), and the whole line is written before the length grows.
+            // (Line is align(64)), and 64 bytes are written before the length grows.
             unsafe {
-                let dst = bucket.lines.as_mut_ptr().add(bucket.lines.len()) as *mut u8;
-                let src = &line as *const Line<T, K> as *const u8;
-                for at in (0..size_of::<Line<T, K>>()).step_by(64) {
-                    stream_line(dst.add(at), src.add(at));
-                }
+                let dst = bucket.lines.as_mut_ptr().add(bucket.lines.len());
+                stream_line(dst as *mut u8, &line as *const Line<T, K> as *const u8);
                 bucket.lines.set_len(bucket.lines.len() + 1);
             }
             bucket.len += K;
@@ -113,25 +109,6 @@ unsafe fn stream_line(dst: *mut u8, src: *const u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn scatter_of_three_line_records() {
-        #[derive(Clone, Copy, Default, PartialEq, Debug)]
-        #[repr(C)]
-        struct R24(u64, u64, u32, u32);
-        let mut s: Scatter<R24, 8> = Scatter::new(5, 1);
-        let mut expected: Vec<Vec<R24>> = vec![Vec::new(); 5];
-        for i in 0..20_000u64 {
-            let b = (i * 2_654_435_761 % 5) as usize;
-            let r = R24(i, !i, i as u32, (i >> 3) as u32);
-            s.push(b, r);
-            expected[b].push(r);
-        }
-        let got = s.finish();
-        for b in 0..5 {
-            assert_eq!(got[b].as_slice(), &expected[b][..]);
-        }
-    }
 
     #[test]
     fn scatter_keeps_every_record_in_order() {

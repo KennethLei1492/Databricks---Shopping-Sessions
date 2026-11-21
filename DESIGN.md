@@ -52,6 +52,21 @@ byte-wise order; any other string goes through a small global interner (`src/key
 | c6a8332 | L2-sized reads, write-combining scatter, fused dedup | 1.23 s | 1.74G instructions |
 | 988dfff | light dedup, mmap input, per-line splitter, bitmask quotes, cheap hash | 1.10 s | best 1.36 -> 1.03 s on 20M |
 | faeaf07 | person bucketing fused into parse, fanout cap 1024/512, 16-byte records | 1.18 s | -12% at 8 threads on 5M; did not transfer |
+| b54186b | hash-once person lookups, lock-free parallel links | 1.22 s | cost model -1.5%; did not transfer |
+| (restored) | main's src back to 988dfff, the best scored pipeline | | identical source to 988dfff |
+
+Why the two later builds scored worse than 988dfff:
+
+- faeaf07's line made links a barrier: an event is filed under its person while it is parsed, so all
+  link work (0.008 s per 1M events on the scorer, about 0.16 s at 20M) must finish before parsing
+  starts, and parsing gains a random person-table lookup per event. 988dfff parsed independently of
+  links and regrouped afterwards.
+- b54186b's concurrent `links-names` step spends 0.15-0.26 s of CPU inserting ~200K IDs on 5M
+  events (atomic inserts and filter updates on shared cache lines), against a few ms before, and it
+  sits on that critical path.
+- Both were accepted on laptop wall-clock and a single-thread cachegrind model. The same binary
+  ranges 0.88-1.37 s on 5M events locally, and cachegrind sees neither barriers nor cross-thread
+  cache-line traffic, so neither measurement can rank changes of this size. Only the scorer can.
 
 What the measurements say (see research/ for the sources and the RAG/verification run):
 

@@ -165,9 +165,6 @@ impl Input {
 pub const SLACK: usize = 64;
 
 /// One well-formed line: field ranges into a buffer that has SLACK readable bytes past the data.
-///
-/// Invariant (established by `parse_records`, the only place a `Rec` is built): for every field
-/// `(s, e)`, `s <= e <= data.len() - SLACK`. The accessors rely on it to skip bounds checks.
 pub struct Rec<'a, const N: usize> {
     data: &'a [u8],
     at: [(usize, usize); N],
@@ -178,9 +175,7 @@ impl<'a, const N: usize> Rec<'a, N> {
     #[inline(always)]
     pub fn get(&self, i: usize) -> &'a [u8] {
         let (s, e) = self.at[i];
-        debug_assert!(s <= e && e + SLACK <= self.data.len());
-        // SAFETY: the struct invariant: s <= e <= data.len() - SLACK.
-        unsafe { self.data.get_unchecked(s..e) }
+        &self.data[s..e]
     }
 
     /// The length of field `i`, unquoted.
@@ -194,9 +189,7 @@ impl<'a, const N: usize> Rec<'a, N> {
     #[inline(always)]
     pub fn wide(&self, i: usize) -> &'a [u8; 16] {
         let s = self.at[i].0;
-        debug_assert!(s + SLACK <= self.data.len());
-        // SAFETY: the struct invariant: s <= data.len() - SLACK, and SLACK >= 16.
-        unsafe { &*(self.data.as_ptr().add(s) as *const [u8; 16]) }
+        self.data[s..s + 16].try_into().unwrap()
     }
 
     pub fn fields(&self) -> [&'a [u8]; N] {
@@ -315,9 +308,6 @@ pub fn parse_records<const N: usize>(data: &[u8], len: usize, start: usize, f: &
             ls += nl + 1;
         }
         if ok {
-            // Rec's invariant: every field of a well-formed line lies within data[..len], in
-            // order (fast path: positions below the newline; slow path: slices of data[..len]).
-            debug_assert!(at.iter().all(|&(s, e)| s <= e && e <= len));
             f(&Rec { data, at });
         }
     }
