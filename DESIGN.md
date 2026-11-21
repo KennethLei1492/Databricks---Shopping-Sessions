@@ -66,3 +66,20 @@ What the measurements say (see research/ for the sources and the RAG/verificatio
 - Container start on native Linux is published at hundreds of ms; how much of the score it is
   is unknown. The diagnostic commits (6ead8eb, f96333d) fail the dev check on purpose to report
   the scorer's machine and per-phase times through five deliberately wrong rows.
+
+### What the scorer itself reported (diagnostic f96333d, dev set, best of 3)
+
+Machine: Intel Xeon @ 2.80 GHz (Cascade Lake), AVX-512, 8 vCPUs (cgroup quota 8), transparent
+huge pages `[madvise]` (so the allocator's MADV_HUGEPAGE regions get huge pages), kernel
+7.0.0-gcp, `/data` on tmpfs (input already in RAM), process exit about 4 ms.
+
+| Threads | 1 | 2 | 4 | 8 | 16 |
+| --- | --- | --- | --- | --- | --- |
+| Wall (1M events) | 0.239 s | 0.133 s | 0.086 s | 0.076 s | 0.082 s |
+
+At 8 threads: links 0.008, parse 0.033, dedup 0.002, sessions 0.010, write 0.006 s; user 0.34 s,
+kernel 0.10 s. Fanout 64/64 0.074 s, 4096/2048 0.086 s; huge pages off 0.082 s; pread 0.075 s.
+
+Consequences: container start is not a large part of the score (the phases scaled to 20M add up
+to about the 1.18 s score); hyperthreads add only 1.13x from 4 to 8 threads; parse is 55% of the
+time at about 580 MB/s per thread, so the parse path is where the next gains are.
