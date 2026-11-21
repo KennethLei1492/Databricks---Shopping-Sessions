@@ -26,6 +26,13 @@ pub struct Chunk {
     pub file: usize,
     pub start: usize,
     pub end: usize,
+    /// DIAGNOSTIC: which replica of the input this chunk stands for (SS_REPLICATE).
+    pub copy: u8,
+}
+
+/// DIAGNOSTIC: how many times every input chunk is parsed (each time with shifted IDs).
+pub fn replicate() -> u8 {
+    std::env::var("SS_REPLICATE").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1)
 }
 
 pub fn list_csv(dir: &Path) -> Vec<PathBuf> {
@@ -61,7 +68,7 @@ impl Input {
     }
 
     pub fn bytes(&self) -> usize {
-        self.sizes.iter().sum()
+        self.sizes.iter().sum::<usize>() * replicate() as usize
     }
 
     /// The offset just after the first newline at or after `at` (or the file size).
@@ -87,7 +94,9 @@ impl Input {
             let mut start = 0;
             while start < size {
                 let end = if start + target >= size { size } else { self.line_end(file, start + target) };
-                out.push(Chunk { file, start, end });
+                for copy in 0..replicate() {
+                    out.push(Chunk { file, start, end, copy });
+                }
                 start = end;
             }
         }
