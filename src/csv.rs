@@ -77,12 +77,15 @@ impl Input {
         self.sizes.iter().sum::<usize>() * replicate() as usize
     }
 
-    /// The offset just after the first newline at or after `at` (or the file size).
+    /// The offset just after the first newline at or after `at` (or the file size). Lines are
+    /// short, so a small first read nearly always finds it.
     fn line_end(&self, file: usize, mut at: usize) -> usize {
         let size = self.sizes[file];
         let mut probe = [0u8; 4096];
+        let mut want = 256;
         while at < size {
-            let n = (size - at).min(probe.len());
+            let n = (size - at).min(want);
+            want = probe.len();
             self.files[file].read_exact_at(&mut probe[..n], at as u64).expect("read");
             if let Some(nl) = memchr(NL, &probe[..n]) {
                 return at + nl + 1;
@@ -92,11 +95,12 @@ impl Input {
         size
     }
 
-    /// Line-aligned chunks of about `target` bytes, largest first.
-    pub fn chunks(&self, target: usize) -> Vec<Chunk> {
-        let mut out = Vec::new();
-        for file in 0..self.files.len() {
+    /// Line-aligned chunks of about `target` bytes, largest first. Each boundary costs a small
+    /// read, so the files' boundaries are found on up to `threads` threads at once.
+    pub fn chunks(&self, target: usize, threads: usize) -> Vec<Chunk> {
+        let file_chunks = |file: usize| {
             let size = self.sizes[file];
+            let mut out = Vec::new();
             let mut start = 0;
             while start < size {
                 let end = if start + target >= size { size } else { self.line_end(file, start + target) };
@@ -105,7 +109,39 @@ impl Input {
                 }
                 start = end;
             }
-        }
+            out
+        };
+        let nf = self.files.len();
+        let workers = threads.clamp(1, nf.max(1));
+        let per_file: Vec<Vec<Chunk>> = if workers == 1 {
+            (0..nf).map(file_chunks).collect()
+        } else {
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let mut slots: Vec<Vec<Chunk>> = vec![Vec::new(); nf];
+            let found: Vec<Vec<(usize, Vec<Chunk>)>> = std::thread::scope(|scope| {
+                let hs: Vec<_> = (0..workers)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            let mut mine = Vec::new();
+                            loop {
+                                let f = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                if f >= nf {
+                                    break mine;
+                                }
+                                mine.push((f, file_chunks(f)));
+                            }
+                        })
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join().expect("chunking thread panicked")).collect()
+            });
+            for (f, c) in found.into_iter().flatten() {
+                slots[f] = c;
+            }
+            slots
+        };
+        // File order, then a stable sort: the same list as finding the boundaries one by one.
+        let mut out: Vec<Chunk> = per_file.into_iter().flatten().collect();
         out.sort_by_key(|c| std::cmp::Reverse(c.end - c.start));
         out
     }

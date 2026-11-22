@@ -459,7 +459,7 @@ struct PartIds {
 fn build_links(data: &Path, threads: usize) -> Persons {
     let t0 = Instant::now();
     let input = csv::Input::open(&csv::list_csv(&data.join("links")));
-    let chunks = input.chunks(chunk_size().min(1 << 20));
+    let chunks = input.chunks(chunk_size().min(1 << 20), threads);
     struct LinkState {
         buf: Vec<u8>,
         pairs: Vec<(Key, Key)>,
@@ -1054,7 +1054,7 @@ fn slot_len<B: Bucket>(slot: &Mutex<Vec<B>>) -> usize {
 /// Single-threaded micro-benchmarks of the event parse path (SS_BENCH=lines|split|event|push).
 fn bench(ctx: &Ctx, data: &Path, mode: &str) {
     let input = csv::Input::open(&csv::list_csv(&data.join("events")));
-    let chunks = input.chunks(chunk_size());
+    let chunks = input.chunks(chunk_size(), 1);
     let t = Instant::now();
     let mut n = 0u64;
     let mut buf = Vec::new();
@@ -1148,15 +1148,21 @@ fn main() {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from))
         .clamp(1, MAX_THREADS);
 
-    let ctx = load_context(&data, start);
     if let Ok(mode) = std::env::var("SS_BENCH") {
-        bench(&ctx, &data, &mode);
+        bench(&load_context(&data, start), &data, &mode);
         return;
     }
-    let events_in = csv::Input::open(&csv::list_csv(&data.join("events")));
-    let clicks_in = csv::Input::open(&csv::list_csv(&data.join("clicks")));
-    let ev_chunks = events_in.chunks(chunk_size());
-    let ck_chunks = clicks_in.chunks(chunk_size());
+    // The lookups (products, campaigns) load on their own thread while the inputs are opened
+    // and cut into chunks: neither needs the other, and both come before parsing.
+    let (ctx, (events_in, clicks_in, ev_chunks, ck_chunks)) = std::thread::scope(|scope| {
+        let ctx = scope.spawn(|| load_context(&data, start));
+        let events_in = csv::Input::open(&csv::list_csv(&data.join("events")));
+        let clicks_in = csv::Input::open(&csv::list_csv(&data.join("clicks")));
+        let ev_chunks = events_in.chunks(chunk_size(), threads);
+        let ck_chunks = clicks_in.chunks(chunk_size(), threads);
+        log(start, &format!("inputs chunked: {} event chunks, {} click chunks", ev_chunks.len(), ck_chunks.len()));
+        (ctx.join().expect("lookups thread panicked"), (events_in, clicks_in, ev_chunks, ck_chunks))
+    });
 
     // Event-id buckets small enough that a bucket's dedup table stays in L2.
     let np: usize = std::env::var("SS_NP")
