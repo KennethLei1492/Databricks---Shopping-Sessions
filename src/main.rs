@@ -1060,7 +1060,7 @@ fn bench(ctx: &Ctx, data: &Path, mode: &str) {
     let mut buf = Vec::new();
     let np = 2048;
     let mut buckets: scatter::Scatter<DedupRec, 4> = scatter::Scatter::new(np);
-    let mut payload: Vec<Pay> = Vec::with_capacity(input.bytes() / 56 + 64);
+    let mut payload: Vec<Vec<Pay>> = (0..LINK_PARTS).map(|_| Vec::with_capacity(input.bytes() / 56 / LINK_PARTS + 1024)).collect();
     for &c in &chunks {
         if mode == "lines" {
             input.lines(c, &mut buf, |line| n += line.len() as u64);
@@ -1088,7 +1088,7 @@ fn bench(ctx: &Ctx, data: &Path, mode: &str) {
 struct DedupRec {
     eid: Key,
     ingest: u32,
-    pref: u32, // thread << REF_BITS | index into that thread's payload
+    pref: u32, // (thread * LINK_PARTS + link_part(user)) << REF_BITS | index into that payload list
 }
 
 /// What a valid event copy contributes if it is its event's kept copy.
@@ -1101,20 +1101,26 @@ struct Pay {
 }
 
 const NOREF: u32 = u32::MAX;
-const REF_BITS: u32 = 26; // up to 64 threads and 67M valid events per thread
-const MAX_THREADS: usize = 1 << (32 - REF_BITS);
+/// A payload reference: the list (thread and the user's link partition) above REF_BITS bits of
+/// index. Up to 16 threads, and 4M valid events per thread and partition (~268M per thread).
+const REF_BITS: u32 = 22;
+const MAX_THREADS: usize = 1 << (32 - REF_BITS - LINK_PARTS.trailing_zeros());
 
-/// Stores a parsed copy: the payload goes to this thread's sequential array, and a 16-byte
-/// record goes to the event-id bucket.
+/// Stores a parsed copy: the payload goes to this thread's sequential array for its user's link
+/// partition (so the person lookups later run one partition of the table at a time, in cache),
+/// and a 16-byte record goes to the event-id bucket.
 #[inline(always)]
-fn push_event(rec: &EvRec, thread: usize, payload: &mut Vec<Pay>, buckets: &mut scatter::Scatter<DedupRec, 4>, np: usize) {
+fn push_event(rec: &EvRec, thread: usize, payload: &mut [Vec<Pay>], buckets: &mut scatter::Scatter<DedupRec, 4>, np: usize) {
     let pref = if rec.ts == INVALID {
         NOREF
     } else {
-        let at = payload.len();
-        assert!(at < (1 << REF_BITS) - 1, "too many events on one thread for a 26-bit reference");
-        payload.push(Pay { user: rec.user, ts: rec.ts, pc: rec.pc });
-        (thread as u32) << REF_BITS | at as u32
+        let part = link_part(rec.user);
+        // SAFETY: link_part < LINK_PARTS = payload.len().
+        let list = unsafe { payload.get_unchecked_mut(part) };
+        let at = list.len();
+        assert!(at < (1 << REF_BITS) - 1, "too many events on one thread and partition for a 22-bit reference");
+        list.push(Pay { user: rec.user, ts: rec.ts, pc: rec.pc });
+        ((thread * LINK_PARTS + part) as u32) << REF_BITS | at as u32
     };
     buckets.push(bucket(rec.eid, np), DedupRec { eid: rec.eid, ingest: rec.ingest, pref });
 }
@@ -1123,8 +1129,8 @@ struct ParseState {
     thread: usize,
     buf: Vec<u8>,
     events: scatter::Scatter<DedupRec, 4>,
-    payload: Vec<Pay>,
-    clicks: Vec<ClickRec>,
+    payload: Vec<Vec<Pay>>, // one list per link partition
+    clicks: Vec<Vec<ClickRec>>, // one list per link partition of the click's user
 }
 
 struct DedupState {
@@ -1185,8 +1191,8 @@ fn main() {
                 thread: thread_ids.fetch_add(1, Ordering::Relaxed),
                 buf: Vec::new(),
                 events: scatter::Scatter::new(np),
-                payload: Vec::with_capacity(pay_estimate),
-                clicks: Vec::with_capacity(ck_estimate),
+                payload: (0..LINK_PARTS).map(|_| Vec::with_capacity(pay_estimate / LINK_PARTS + 1024)).collect(),
+                clicks: (0..LINK_PARTS).map(|_| Vec::with_capacity(ck_estimate / LINK_PARTS + 256)).collect(),
             },
             |st, task| {
                 let ParseState { thread, buf, events, payload, clicks } = st;
@@ -1218,7 +1224,8 @@ fn main() {
                                 rec.person = key::salt(rec.person, chunk.copy);
                                 rec.cid = key::salt(rec.cid, chunk.copy);
                             }
-                            clicks.push(rec);
+                            // SAFETY: link_part < LINK_PARTS = clicks.len().
+                            unsafe { clicks.get_unchecked_mut(link_part(rec.person)) }.push(rec);
                         }
                     });
                 }
@@ -1233,12 +1240,18 @@ fn main() {
     log(start, "long IDs published");
     log(start, "links joined");
     let mut ev_threads = Vec::with_capacity(parsed.len());
-    let mut payloads: Vec<Vec<Pay>> = (0..threads).map(|_| Vec::new()).collect();
-    let mut ck_lists = Vec::with_capacity(parsed.len());
+    // Indexed by thread * LINK_PARTS + partition, as in a payload reference.
+    let mut payloads: Vec<Vec<Pay>> = (0..threads * LINK_PARTS).map(|_| Vec::new()).collect();
+    // Indexed by thread * LINK_PARTS + partition, like the payloads.
+    let mut ck_lists: Vec<Vec<ClickRec>> = (0..threads * LINK_PARTS).map(|_| Vec::new()).collect();
     for st in parsed {
         ev_threads.push(st.events.finish());
-        payloads[st.thread] = st.payload;
-        ck_lists.push(st.clicks);
+        for (part, list) in st.payload.into_iter().enumerate() {
+            payloads[st.thread * LINK_PARTS + part] = list;
+        }
+        for (part, list) in st.clicks.into_iter().enumerate() {
+            ck_lists[st.thread * LINK_PARTS + part] = list;
+        }
     }
     let ev_slots = regroup(ev_threads, np);
     // One bit per payload entry, set when that copy lost its event's dedup.
@@ -1307,17 +1320,19 @@ fn main() {
     log(start, "deduplicated events");
 
     // ---- map users to persons and bucket by person: kept events (sequential over each
-    // thread's payload) and clicks, both cut into small ranges so no task is a straggler
+    // payload list) and clicks, both cut into small ranges so no task is a straggler.
+    // Partition-major: the threads work through the person table one partition (a few MB at
+    // most) at a time, so its lookups hit cache instead of memory.
     const RANGE: usize = 32 * 1024;
     let mut ranges: Vec<(bool, usize, usize, usize)> = Vec::new();
-    for (li, list) in ck_lists.iter().enumerate() {
-        for s in (0..list.len()).step_by(RANGE) {
-            ranges.push((true, li, s, (s + RANGE).min(list.len())));
-        }
-    }
-    for (t, pay) in payloads.iter().enumerate() {
-        for s in (0..pay.len()).step_by(RANGE) {
-            ranges.push((false, t, s, (s + RANGE).min(pay.len())));
+    for part in 0..LINK_PARTS {
+        for t in 0..threads {
+            let li = t * LINK_PARTS + part;
+            for (is_click, n) in [(true, ck_lists[li].len()), (false, payloads[li].len())] {
+                for s in (0..n).step_by(RANGE) {
+                    ranges.push((is_click, li, s, (s + RANGE).min(n)));
+                }
+            }
         }
     }
     // Person buckets small enough that a bucket's events, clicks and their sorted copies stay
