@@ -17,6 +17,8 @@ mimalloc = { version = "0.1.52", default-features = false }
 # SS_REPLICATE: parse the input several times over with shifted IDs, to measure at the practice
 # set's scale from the dev set (scripts/scale_bench.sh). Off in the submitted build.
 scale = []
+# DIAGNOSTIC BUILD ONLY: replication on by default so the scorer's build has it.
+default = ["scale"]
 
 [profile.release]
 opt-level = 3
