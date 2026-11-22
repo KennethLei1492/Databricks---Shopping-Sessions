@@ -820,6 +820,7 @@ struct Agg {
     catsum: Vec<i64>,
     day_purchase: bool, // catsum holds something for the current person-day
     lows: Vec<u64>,     // scratch: one person's events as ts << 32 | price << 8 | category
+    bins: Vec<u32>,     // scratch for bin_scatter
 }
 
 impl Agg {
@@ -887,7 +888,8 @@ fn process_person(ctx: &Ctx, agg: &mut Agg, person: Key, evs: &[u64], clicks: &[
     let mut s = 0;
     while s < evs.len() {
         let mut e = s + 1;
-        while e < evs.len() && (ev_ts(evs[e]) - ev_ts(evs[e - 1])) as i64 <= GAP {
+        // SAFETY: e < evs.len() is checked first, and e - 1 >= s >= 0.
+        while e < evs.len() && unsafe { (ev_ts(*evs.get_unchecked(e)) - ev_ts(*evs.get_unchecked(e - 1))) as i64 } <= GAP {
             e += 1;
         }
         let start = ctx.ws + ev_ts(evs[s]) as i64;
@@ -944,13 +946,18 @@ fn process_person(ctx: &Ctx, agg: &mut Agg, person: Key, evs: &[u64], clicks: &[
         } else {
             organic
         };
+        // Sessions start inside the window, so di < ndays; campaigns are <= organic.
+        debug_assert!(di < ndays && credited <= organic);
         let cell = &mut agg.camp[credited * ndays + di];
         cell[0] += 1;
         cell[1] += purchased as i64;
         cell[2] += revenue;
         // Every campaign with a click in the window assists once.
         for &c in &agg.active {
-            agg.camp[c as usize * ndays + di][3] += 1;
+            debug_assert!((c as usize) < organic);
+            // SAFETY: c < organic and di < ndays, so the index is below (organic + 1) * ndays,
+            // the length of agg.camp.
+            unsafe { agg.camp.get_unchecked_mut(c as usize * ndays + di)[3] += 1 };
         }
         s = e;
     }
@@ -1002,11 +1009,15 @@ fn regroup<B: Bucket>(per_thread: Vec<Vec<B>>, n: usize) -> Vec<Mutex<Vec<B>>> {
 
 /// Counting-sort scatter of several pieces into `nb` bins: returns the binned records and the
 /// start of each bin (nb + 1 offsets). Reads each piece in place, so no concatenation copy.
-fn bin_scatter<T: Copy>(pieces: &[&[T]], nb: usize, bin: impl Fn(&T) -> usize) -> (Vec<T>, Vec<usize>) {
+/// Each record's bin is computed once, in the counting pass, and kept in `bins` (reused scratch).
+fn bin_scatter<T: Copy>(pieces: &[&[T]], nb: usize, bin: impl Fn(&T) -> usize, bins: &mut Vec<u32>) -> (Vec<T>, Vec<usize>) {
     let mut at = vec![0usize; nb + 1];
+    bins.clear();
     for piece in pieces {
         for x in piece.iter() {
-            at[bin(x) + 1] += 1;
+            let b = bin(x);
+            bins.push(b as u32);
+            at[b + 1] += 1;
         }
     }
     for b in 0..nb {
@@ -1017,11 +1028,18 @@ fn bin_scatter<T: Copy>(pieces: &[&[T]], nb: usize, bin: impl Fn(&T) -> usize) -
     let mut out: Vec<T> = Vec::with_capacity(n);
     let spare = out.spare_capacity_mut();
     let mut next = at.clone();
+    let mut i = 0;
     for piece in pieces {
         for x in piece.iter() {
-            let b = bin(x);
-            spare[next[b]].write(*x);
-            next[b] += 1;
+            // SAFETY: bins has one entry per record (pushed above in the same order), each < nb,
+            // and next[b] < at[b + 1] <= n = spare.len() while bin b still has records to place.
+            unsafe {
+                let b = *bins.get_unchecked(i) as usize;
+                let slot = next.get_unchecked_mut(b);
+                spare.get_unchecked_mut(*slot).write(*x);
+                *slot += 1;
+            }
+            i += 1;
         }
     }
     // SAFETY: the counting pass sized each bin exactly, so all n slots were written above.
@@ -1387,6 +1405,7 @@ fn main() {
             catsum: vec![0; ctx.categories.len()],
             day_purchase: false,
             lows: Vec::new(),
+            bins: Vec::new(),
         },
         |agg, task| {
             let q = order[task];
@@ -1399,8 +1418,8 @@ fn main() {
             let bin = |p: Key| ((key::hash(p) >> 16) as usize) & (nb - 1);
             let ev_slices: Vec<&[u128]> = ev_pieces.iter().flat_map(|p| p.slices()).collect();
             let ck_slices: Vec<&[ClickRec]> = ck_pieces.iter().flat_map(|p| p.slices()).collect();
-            let (mut evs, ev_at) = bin_scatter(&ev_slices, nb, |x: &u128| bin((x >> 64) as u64));
-            let (mut cks, ck_at) = bin_scatter(&ck_slices, nb, |c: &ClickRec| bin(c.person));
+            let (mut evs, ev_at) = bin_scatter(&ev_slices, nb, |x: &u128| bin((x >> 64) as u64), &mut agg.bins);
+            let (mut cks, ck_at) = bin_scatter(&ck_slices, nb, |c: &ClickRec| bin(c.person), &mut agg.bins);
             drop(ev_slices);
             drop(ck_slices);
             drop(ev_pieces);
@@ -1416,11 +1435,16 @@ fn main() {
                 cks.sort_unstable_by_key(|c| (c.person as u128) << 32 | c.ts as u128);
                 let mut lows = std::mem::take(&mut agg.lows);
                 let first = (evs[0] >> 64) as u64;
-                if evs.iter().all(|&x| (x >> 64) as u64 == first) {
-                    // The usual bin: one person. Their events sort as 64-bit (ts, payload)
-                    // values, which is much cheaper than sorting 128-bit (person, ts, payload).
-                    lows.clear();
-                    lows.extend(evs.iter().map(|&x| x as u64));
+                // The usual bin is one person: copy the low halves while checking that.
+                lows.clear();
+                let mut one = true;
+                for &x in evs.iter() {
+                    one &= (x >> 64) as u64 == first;
+                    lows.push(x as u64);
+                }
+                if one {
+                    // Their events sort as 64-bit (ts, payload) values, which is much cheaper
+                    // than sorting 128-bit (person, ts, payload).
                     lows.sort_unstable();
                     let c0 = cks.partition_point(|c| c.person < first);
                     let c1 = c0 + cks[c0..].partition_point(|c| c.person == first);
