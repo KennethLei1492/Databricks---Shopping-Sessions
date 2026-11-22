@@ -200,6 +200,15 @@ fn cpu_now() -> (f64, f64, i64) {
     }
 }
 
+/// (anonymous, file-backed) resident memory of the process in MB, from /proc/self/status.
+fn rss_mb() -> (u64, u64) {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |name: &str| {
+        status.lines().find(|l| l.starts_with(name)).and_then(|l| l.split_whitespace().nth(1)).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) / 1024
+    };
+    (field("RssAnon:"), field("RssFile:") + field("RssShmem:"))
+}
+
 fn parallel<S: Send>(
     name: &str,
     threads: usize,
@@ -245,8 +254,9 @@ fn parallel<S: Send>(
     let slowest_spawn = results.iter().map(|r| r.5).fold(0f64, f64::max);
     let slowest_init = results.iter().map(|r| r.4 - r.5).fold(0f64, f64::max);
     let cpu1 = cpu_now();
+    let (anon, file) = rss_mb();
     eprintln!(
-        "  phase {name}: {n} tasks, wall {wall:.3}s, utilization {:.0}%, user {:.3}s, kernel {:.3}s, faults {}k, longest task #{longest_task} {longest:.3}s, slowest thread start {slowest_start:.3}s (spawn {:.3}s, init {:.3}s)",
+        "  phase {name}: {n} tasks, wall {wall:.3}s, utilization {:.0}%, user {:.3}s, kernel {:.3}s, faults {}k, rss anon {anon} MB file {file} MB, longest task #{longest_task} {longest:.3}s, slowest thread start {slowest_start:.3}s (spawn {:.3}s, init {:.3}s)",
         100.0 * busy / (threads as f64 * wall).max(1e-9),
         cpu1.0 - cpu0.0,
         cpu1.1 - cpu0.1,
@@ -941,7 +951,7 @@ fn bench(ctx: &Ctx, data: &Path, mode: &str) {
     let mut n = 0u64;
     let mut buf = Vec::new();
     let np = 2048;
-    let mut buckets: scatter::Scatter<DedupRec, 4> = scatter::Scatter::new(np, input.bytes() / 56 / np + 64);
+    let mut buckets: scatter::Scatter<DedupRec, 4> = scatter::Scatter::new(np);
     let mut payload: Vec<Pay> = Vec::with_capacity(input.bytes() / 56 + 64);
     for &c in &chunks {
         if mode == "lines" {
@@ -1047,7 +1057,6 @@ fn main() {
         .unwrap_or((events_in.bytes() / 76 / 8192).next_power_of_two())
         .clamp(64, 4096);
     // Capacities with headroom: a doubling copy of a big array costs far more than slack.
-    let ev_estimate = events_in.bytes() / 56 / np / threads + 64;
     let pay_estimate = events_in.bytes() / 56 / threads + 64;
     let ck_estimate = clicks_in.bytes() / 30 / threads + 64;
     let n_tasks = ev_chunks.len() + ck_chunks.len();
@@ -1067,7 +1076,7 @@ fn main() {
             || ParseState {
                 thread: thread_ids.fetch_add(1, Ordering::Relaxed),
                 buf: Vec::new(),
-                events: scatter::Scatter::new(np, ev_estimate),
+                events: scatter::Scatter::new(np),
                 payload: Vec::with_capacity(pay_estimate),
                 clicks: Vec::with_capacity(ck_estimate),
             },
@@ -1122,7 +1131,7 @@ fn main() {
             }
             let mask = cap - 1;
             for piece in &owned {
-                for r in piece.as_slice() {
+                for r in piece.slices().flatten() {
                     let mut slot = key::hash(r.eid) as usize & mask;
                     loop {
                         debug_assert!(slot < st.table.len());
@@ -1187,15 +1196,13 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or((events_in.bytes() / 76 / 16384).next_power_of_two())
         .clamp(64, 4096);
-    let sess_estimate = events_in.bytes() / 56 / nq / threads + 64;
-    let ck_bucket_estimate = clicks_in.bytes() / 30 / nq / threads + 64;
     let regrouped = parallel(
         "regroup",
         threads,
         ranges.len(),
         || RegroupState {
-            sess: scatter::Scatter::new(nq, sess_estimate),
-            clicks: scatter::Scatter::new(nq, ck_bucket_estimate),
+            sess: scatter::Scatter::new(nq),
+            clicks: scatter::Scatter::new(nq),
         },
         |st, task| {
             let (is_click, li, s, e) = ranges[task];
@@ -1277,8 +1284,8 @@ fn main() {
             // clicks share a bin, and a bin holds only a few persons, so sorting it is cheap.
             let nb = (n_ev / 8).next_power_of_two().clamp(16, 1 << 16);
             let bin = |p: Key| ((key::hash(p) >> 16) as usize) & (nb - 1);
-            let ev_slices: Vec<&[u128]> = ev_pieces.iter().map(|p| p.as_slice()).collect();
-            let ck_slices: Vec<&[ClickRec]> = ck_pieces.iter().map(|p| p.as_slice()).collect();
+            let ev_slices: Vec<&[u128]> = ev_pieces.iter().flat_map(|p| p.slices()).collect();
+            let ck_slices: Vec<&[ClickRec]> = ck_pieces.iter().flat_map(|p| p.slices()).collect();
             let (mut evs, ev_at) = bin_scatter(&ev_slices, nb, |x: &u128| bin((x >> 64) as u64));
             let (mut cks, ck_at) = bin_scatter(&ck_slices, nb, |c: &ClickRec| bin(c.person));
             drop(ev_slices);
