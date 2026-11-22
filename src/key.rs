@@ -125,18 +125,6 @@ pub fn pack_fast_wide(w: &[u8; 16], len: usize) -> Option<Key> {
     pack_fast(&w[..len.min(16)])
 }
 
-/// DIAGNOSTIC: the key of replica `copy` of an ID: the code of its second character rotated by
-/// `copy` within 1..=36 (fast keys only; a bijection, so replicas keep their structure).
-#[inline(always)]
-pub fn salt(k: Key, copy: u8) -> Key {
-    let code = (k >> 48) & 63;
-    if copy == 0 || k >> 60 != 0 || code == 0 {
-        return k;
-    }
-    let new = (code - 1 + copy as u64) % 36 + 1;
-    (k & !(63 << 48)) | new << 48
-}
-
 #[inline(always)]
 pub fn pack(s: &[u8]) -> Key {
     match pack_fast(s) {
