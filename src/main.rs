@@ -11,7 +11,6 @@
 //!   5. write Parquet
 
 mod csv;
-mod diag;
 mod key;
 mod out;
 mod scatter;
@@ -1139,8 +1138,6 @@ struct RegroupState {
 }
 
 fn main() {
-    // DIAGNOSTIC BUILD: the parent measures child runs at scale and reports them in five rows.
-    let notes: Vec<String> = if std::env::var("SS_CHILD").is_err() { diag::run() } else { Vec::new() };
     let start = Instant::now();
     let args: Vec<String> = std::env::args().collect();
     let data = PathBuf::from(std::env::var("DATA_DIR").ok().or_else(|| args.get(1).cloned()).unwrap_or("/data".into()));
@@ -1513,7 +1510,7 @@ fn main() {
     let campaign_rows = AtomicUsize::new(0);
     parallel("write", threads, pieces.len() + 1, || (), |_, task| {
         if task == pieces.len() {
-            campaign_rows.store(write_campaigns(&ctx, &camp_total, &cd_dir, &notes), Ordering::Relaxed);
+            campaign_rows.store(write_campaigns(&ctx, &camp_total, &cd_dir), Ordering::Relaxed);
             return;
         }
         let (li, s, e) = pieces[task];
@@ -1554,7 +1551,7 @@ fn main() {
 }
 
 /// Writes campaign_daily from the summed (campaign or organic) x day cells; returns its rows.
-fn write_campaigns(ctx: &Ctx, camp_total: &[[i64; 4]], cd_dir: &Path, notes: &[String]) -> usize {
+fn write_campaigns(ctx: &Ctx, camp_total: &[[i64; 4]], cd_dir: &Path) -> usize {
     let ncamp = ctx.campaign_ids.len();
     let mut campaign_id = out::Col::default();
     let mut channel = out::Col::default();
@@ -1572,11 +1569,7 @@ fn write_campaigns(ctx: &Ctx, camp_total: &[[i64; 4]], cd_dir: &Path, notes: &[S
                 channel.push_str(b"organic");
             } else {
                 campaign_id.push_str(&ctx.campaign_ids[c]);
-                // DIAGNOSTIC: the first rows' channel carries the notes (row n of the table).
-                match notes.get(n) {
-                    Some(note) => channel.push_str(note.as_bytes()),
-                    None => channel.push_str(&ctx.channels[c]),
-                }
+                channel.push_str(&ctx.channels[c]);
             }
             day.push_i32((ctx.day0 + d as i64) as i32);
             // sessions, purchasing_sessions, revenue_cents, assisted_sessions
