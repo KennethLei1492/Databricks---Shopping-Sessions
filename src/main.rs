@@ -1207,6 +1207,10 @@ fn main() {
         log(start, &format!("parsed {} MB events, {} MB clicks", events_in.bytes() >> 20, clicks_in.bytes() >> 20));
         (parsed, links.join().expect("links thread panicked"))
     });
+    // The long user and click IDs the parse threads noted go to the dictionary before anything
+    // reads names (sessions' click tie-breaks, the output).
+    key::publish(threads);
+    log(start, "long IDs published");
     log(start, "links joined");
     let mut ev_threads = Vec::with_capacity(parsed.len());
     let mut payloads: Vec<Vec<Pay>> = (0..threads).map(|_| Vec::new()).collect();

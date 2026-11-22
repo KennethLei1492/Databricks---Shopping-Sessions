@@ -197,8 +197,16 @@ pub fn pack(s: &[u8]) -> Key {
 pub fn pack_wide(w: &[u8; 16], s: &[u8]) -> Key {
     match pack_fast_wide(w, s.len()) {
         Some(k) => k,
-        None => pack_slow(s),
+        None => pack_noted(s),
     }
+}
+
+/// A slow key whose string is noted on this thread (no lock) and reaches the dictionary at
+/// `publish`.
+fn pack_noted(s: &[u8]) -> Key {
+    let k = slow_key(s);
+    LOCAL.with(|l| l.borrow_mut().0.note(k, s));
+    k
 }
 
 /// `pack_wide` for an ID that is only ever compared for equality (event IDs): a slow-form key is
@@ -214,6 +222,12 @@ pub fn pack_wide_anon(w: &[u8; 16], s: &[u8]) -> Key {
 /// The slow-form key of `s`, with `s` recorded in the dictionary (see the module docs).
 fn pack_slow(s: &[u8]) -> Key {
     let k = slow_key(s);
+    record(k, s);
+    k
+}
+
+/// Puts `s` in the dictionary under `k`, checking that a key already there names the same bytes.
+fn record(k: Key, s: &[u8]) {
     let mut shard = dict()[shard_of(k)].lock().unwrap();
     match shard.at.get(&k) {
         Some(&(at, n)) => {
@@ -226,7 +240,94 @@ fn pack_slow(s: &[u8]) -> Key {
             shard.at.insert(k, (at as u32, s.len() as u32));
         }
     }
-    k
+}
+
+/// Slow keys a thread made with `pack_wide` and the strings behind them, kept on the thread so
+/// parsing takes no lock: a set of the keys it has seen (open addressing, 0 = empty, which no
+/// slow key is) and the first occurrence of each. When the thread ends they move to PENDING;
+/// `publish` puts them in the dictionary before anything reads names.
+#[derive(Default)]
+struct Local {
+    seen: Vec<u64>,
+    n: usize,
+    arena: Vec<u8>,
+    entries: Vec<(Key, u32, u32)>,
+}
+
+impl Local {
+    #[inline]
+    fn note(&mut self, k: Key, s: &[u8]) {
+        if 2 * (self.n + 1) > self.seen.len() {
+            self.grow();
+        }
+        let mask = self.seen.len() - 1;
+        let mut at = k as usize & mask;
+        loop {
+            let v = self.seen[at];
+            if v == k {
+                return;
+            }
+            if v == 0 {
+                self.seen[at] = k;
+                self.n += 1;
+                self.entries.push((k, self.arena.len() as u32, s.len() as u32));
+                self.arena.extend_from_slice(s);
+                return;
+            }
+            at = (at + 1) & mask;
+        }
+    }
+
+    #[cold]
+    fn grow(&mut self) {
+        let cap = (self.seen.len() * 2).max(1 << 12);
+        let old = std::mem::replace(&mut self.seen, vec![0; cap]);
+        let mask = cap - 1;
+        for k in old.into_iter().filter(|&k| k != 0) {
+            let mut at = k as usize & mask;
+            while self.seen[at] != 0 {
+                at = (at + 1) & mask;
+            }
+            self.seen[at] = k;
+        }
+    }
+}
+
+struct LocalCell(Local);
+
+impl Drop for LocalCell {
+    fn drop(&mut self) {
+        if !self.0.entries.is_empty() {
+            let mut local = std::mem::take(&mut self.0);
+            local.seen = Vec::new();
+            PENDING.lock().unwrap().push(local);
+        }
+    }
+}
+
+static PENDING: Mutex<Vec<Local>> = Mutex::new(Vec::new());
+
+thread_local! {
+    static LOCAL: std::cell::RefCell<LocalCell> = std::cell::RefCell::new(LocalCell(Local::default()));
+}
+
+/// Puts every pending string (from threads that have ended) in the
+/// dictionary, on `threads` threads. Must run before `bytes`/`cmp`/`append_bytes` read a key made
+/// by `pack_wide`.
+pub fn publish(threads: usize) {
+    let lists = std::mem::take(&mut *PENDING.lock().unwrap());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..threads.max(1) {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(list) = lists.get(i) else { break };
+                for &(k, at, n) in &list.entries {
+                    record(k, &list.arena[at as usize..(at + n) as usize]);
+                }
+            });
+        }
+    });
 }
 
 #[inline(always)]
@@ -353,6 +454,38 @@ mod tests {
         assert!(pack_fast(b"zzzzzzzzzz").unwrap() < SLOW);
         assert_eq!(pack_fast(b"zzzzzzzzzzz"), None);
         assert_eq!(pack_fast(b"U1"), None);
+    }
+
+    /// Keys from `pack_wide` on worker threads reach the dictionary at `publish`, once per string.
+    #[test]
+    fn noted_keys_published() {
+        let words: Vec<String> = (0..20_000u64).map(|i| format!("k{:032x}", i.wrapping_mul(0x9E37_79B9_7F4A_7C15))).collect();
+        let keys: Vec<Vec<Key>> = std::thread::scope(|scope| {
+            let hs: Vec<_> = (0..4)
+                .map(|t| {
+                    let words = &words;
+                    scope.spawn(move || {
+                        words
+                            .iter()
+                            .skip(t)
+                            .step_by(2)
+                            .map(|w| {
+                                let mut win = [0u8; 16];
+                                win.copy_from_slice(&w.as_bytes()[..16]);
+                                pack_wide(&win, w.as_bytes())
+                            })
+                            .collect()
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        publish(4);
+        for (t, ks) in keys.iter().enumerate() {
+            for (i, &k) in ks.iter().enumerate() {
+                assert_eq!(bytes(k), words[t + 2 * i].as_bytes().to_vec());
+            }
+        }
     }
 
     /// Long IDs (a letter and 32 hex digits, as one ID in eight in the data) take the slow form:
