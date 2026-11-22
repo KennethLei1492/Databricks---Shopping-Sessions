@@ -8,7 +8,7 @@ for bin in "$@"; do
   rm -rf ~/ss/cost_out
   out=$(NCPU=1 ~/ss/vg/root/usr/bin/valgrind --tool=cachegrind --cache-sim=yes --branch-sim=yes \
         --D1=32768,8,64 --LL=1048576,16,64 --cachegrind-out-file=$HOME/ss/cost.$(basename "$bin") \
-        "$bin" ~/ss/dev ~/ss/cost_out 2>&1)
+        "$bin" ${COST_DATA:-~/ss/dev} ~/ss/cost_out 2>&1)
   ir=$(echo "$out" | grep "I *refs:" | awk '{print $4}' | tr -d ,)
   bm=$(echo "$out" | grep "Mispredicts:" | awk '{print $3}' | tr -d ,)
   d1=$(echo "$out" | grep "D1  misses:" | awk '{print $4}' | tr -d ,)

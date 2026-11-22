@@ -5,17 +5,21 @@
 //! order and 0 as padding, first byte most significant. It is injective, and integer order equals
 //! byte-wise order (a prefix pads with 0, so it sorts first). It fits in 60 bits.
 //!
-//! Slow form (top bit 1): any other string, through a sharded global interner. Rare in the data
-//! (upper-cased dirt, hand-made edge cases); `cmp` falls back to the bytes.
+//! Slow form (top bit 1): any other string (one ID in eight carries a 32-character hex suffix),
+//! as a 62-bit hash of its bytes. Event IDs, which are only compared for equality, use the hash
+//! alone (`pack_wide_anon`). IDs whose bytes are needed later (user and click IDs: names, byte
+//! order, output) are also recorded in a sharded dictionary keyed by the hash, which checks that
+//! no two different strings share one; `cmp` and `bytes` read the strings from it.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::{Mutex, OnceLock};
 
 pub type Key = u64;
-pub const EMPTY: Key = u64::MAX; // never produced: slow ids stay far below 2^63 - 1
+pub const EMPTY: Key = u64::MAX; // never produced: a slow key's bit 62 is always 0
 const SLOW: u64 = 1 << 63;
-const SHARDS: usize = 64;
+const SHARDS: usize = 256;
 pub const MAX_FAST: usize = 10;
 
 static CODE: [u8; 256] = {
@@ -35,24 +39,67 @@ static CODE: [u8; 256] = {
 
 static CHAR: [u8; 37] = *b"\x000123456789abcdefghijklmnopqrstuvwxyz";
 
-struct Shard {
-    ids: HashMap<Vec<u8>, u64>,
-    strings: Vec<Vec<u8>>,
-}
+/// A hasher for keys that are already hashes: the key itself.
+#[derive(Default)]
+struct KeyHasher(u64);
 
-fn interner() -> &'static Vec<Mutex<Shard>> {
-    static INTERNER: OnceLock<Vec<Mutex<Shard>>> = OnceLock::new();
-    INTERNER.get_or_init(|| {
-        (0..SHARDS).map(|_| Mutex::new(Shard { ids: HashMap::new(), strings: Vec::new() })).collect()
-    })
-}
-
-fn shard_of(s: &[u8]) -> usize {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &c in s {
-        h = (h ^ c as u64).wrapping_mul(0x100_0000_01b3);
+impl Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
     }
-    (h % SHARDS as u64) as usize
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("only u64 keys")
+    }
+    fn write_u64(&mut self, k: u64) {
+        self.0 = k;
+    }
+}
+
+/// One shard of the dictionary: key -> (offset, length) of its string in the shard's arena.
+struct Shard {
+    at: HashMap<Key, (u32, u32), BuildHasherDefault<KeyHasher>>,
+    arena: Vec<u8>,
+}
+
+fn dict() -> &'static Vec<Mutex<Shard>> {
+    static DICT: OnceLock<Vec<Mutex<Shard>>> = OnceLock::new();
+    DICT.get_or_init(|| (0..SHARDS).map(|_| Mutex::new(Shard { at: HashMap::default(), arena: Vec::new() })).collect())
+}
+
+/// The shard of a slow key: high hash bits (the shard's map indexes by the low ones).
+#[inline(always)]
+fn shard_of(k: Key) -> usize {
+    (k >> 48) as usize % SHARDS
+}
+
+/// 64-bit hash of a byte string: its length, then 8-byte words, each mixed in with a 128-bit
+/// multiply folded to 64 bits.
+#[inline]
+pub fn hash_bytes(s: &[u8]) -> u64 {
+    #[inline(always)]
+    fn mix(x: u64, m: u64) -> u64 {
+        let p = x as u128 * m as u128;
+        (p >> 64) as u64 ^ p as u64
+    }
+    let mut h = mix(s.len() as u64 ^ 0x243F_6A88_85A3_08D3, 0x9E37_79B9_7F4A_7C15);
+    let mut chunks = s.chunks_exact(8);
+    for c in &mut chunks {
+        h = mix(h ^ u64::from_le_bytes(c.try_into().unwrap()), 0xD6E8_FEB8_6659_FD93);
+    }
+    let rest = chunks.remainder();
+    if !rest.is_empty() {
+        let mut w = [0u8; 8];
+        w[..rest.len()].copy_from_slice(rest);
+        h = mix(h ^ u64::from_le_bytes(w), 0xD6E8_FEB8_6659_FD93);
+    }
+    mix(h, 0xA076_1D64_78BD_642F)
+}
+
+/// The slow-form key of `s`: the top bit, and 62 bits of its hash (bit 62 stays 0, so a slow key
+/// is never EMPTY).
+#[inline]
+fn slow_key(s: &[u8]) -> Key {
+    SLOW | (hash_bytes(s) >> 2)
 }
 
 /// The fast-form key, or None when the string does not fit it. Never interns. (Scalar reference.)
@@ -154,20 +201,32 @@ pub fn pack_wide(w: &[u8; 16], s: &[u8]) -> Key {
     }
 }
 
-#[cold]
+/// `pack_wide` for an ID that is only ever compared for equality (event IDs): a slow-form key is
+/// the hash alone, with no dictionary entry, so `bytes` and `cmp` must never see it.
+#[inline(always)]
+pub fn pack_wide_anon(w: &[u8; 16], s: &[u8]) -> Key {
+    match pack_fast_wide(w, s.len()) {
+        Some(k) => k,
+        None => slow_key(s),
+    }
+}
+
+/// The slow-form key of `s`, with `s` recorded in the dictionary (see the module docs).
 fn pack_slow(s: &[u8]) -> Key {
-    let at = shard_of(s);
-    let mut shard = interner()[at].lock().unwrap();
-    let local = match shard.ids.get(s) {
-        Some(&id) => id,
-        None => {
-            let id = shard.strings.len() as u64;
-            shard.strings.push(s.to_vec());
-            shard.ids.insert(s.to_vec(), id);
-            id
+    let k = slow_key(s);
+    let mut shard = dict()[shard_of(k)].lock().unwrap();
+    match shard.at.get(&k) {
+        Some(&(at, n)) => {
+            let known = &shard.arena[at as usize..(at + n) as usize];
+            assert!(known == s, "two different IDs share a 62-bit hash: {:?} {:?}", known, s);
         }
-    };
-    SLOW | (local * SHARDS as u64 + at as u64)
+        None => {
+            let at = shard.arena.len();
+            shard.arena.extend_from_slice(s);
+            shard.at.insert(k, (at as u32, s.len() as u32));
+        }
+    }
+    k
 }
 
 #[inline(always)]
@@ -185,9 +244,9 @@ pub fn bytes(k: Key) -> Vec<u8> {
 #[inline]
 pub fn append_bytes(k: Key, out: &mut Vec<u8>) {
     if is_slow(k) {
-        let id = k & !SLOW;
-        let shard = interner()[(id % SHARDS as u64) as usize].lock().unwrap();
-        out.extend_from_slice(&shard.strings[(id / SHARDS as u64) as usize]);
+        let shard = dict()[shard_of(k)].lock().unwrap();
+        let &(at, n) = shard.at.get(&k).expect("slow key without a dictionary entry");
+        out.extend_from_slice(&shard.arena[at as usize..(at + n) as usize]);
     } else {
         // All ten codes into a stack buffer, then one copy of the non-padding prefix.
         let mut buf = [0u8; MAX_FAST];
@@ -294,6 +353,37 @@ mod tests {
         assert!(pack_fast(b"zzzzzzzzzz").unwrap() < SLOW);
         assert_eq!(pack_fast(b"zzzzzzzzzzz"), None);
         assert_eq!(pack_fast(b"U1"), None);
+    }
+
+    /// Long IDs (a letter and 32 hex digits, as one ID in eight in the data) take the slow form:
+    /// equal strings give equal keys, different strings different keys, the bytes come back, and
+    /// the anonymous form (event IDs) agrees with the recorded one.
+    #[test]
+    fn long_ids() {
+        let mut x: u64 = 0x1234_5678_9ABC_DEF1;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut seen = std::collections::HashMap::new();
+        for i in 0..100_000 {
+            let s = format!("u{:016x}{:016x}", next(), next());
+            let mut w = [0u8; 16];
+            w.copy_from_slice(&s.as_bytes()[..16]);
+            let k = pack_wide(&w, s.as_bytes());
+            assert!(is_slow(k) && k != EMPTY);
+            assert_eq!(pack_wide_anon(&w, s.as_bytes()), k);
+            assert_eq!(pack(s.as_bytes()), k);
+            assert_eq!(bytes(k), s.as_bytes().to_vec());
+            assert!(seen.insert(k, s.clone()).is_none(), "distinct strings, distinct keys ({i})");
+        }
+        // Byte order against short IDs too.
+        let a = pack(b"u0000000000000000000000000000000001");
+        let b = pack(b"u1");
+        assert_eq!(cmp(a, b), Ordering::Less);
+        assert_eq!(cmp(b, a), Ordering::Greater);
     }
 
     /// Generator-like IDs (a letter plus base-36 digits) must spread evenly over every bit range

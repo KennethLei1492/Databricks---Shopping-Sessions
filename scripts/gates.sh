@@ -17,6 +17,12 @@ for c in 262144 333 70; do
   SS_CHUNK=$c "$BIN" ~/ss/dev ~/ss/g_dev 2>/dev/null
   check "dev chunk=$c" "$($PY "$HERE/scripts/compare.py" ~/ss/g_dev "$HERE/vendor/dev-answer/dev-answer" | tail -1)" MATCH
 done
+# The current public dev set (generator v5: long hex IDs) against its answer, when present.
+if [ -d "${DEV2:-$HOME/ss/dev5}" ] && [ -d "${ANS2:-$HOME/ss/dl_v5/ans/dev-answer}" ]; then
+  rm -rf ~/ss/g_dev
+  "$BIN" "${DEV2:-$HOME/ss/dev5}" ~/ss/g_dev 2>/dev/null
+  check "dev v5" "$($PY "$HERE/scripts/compare.py" ~/ss/g_dev "${ANS2:-$HOME/ss/dl_v5/ans/dev-answer}" | tail -1)" MATCH
+fi
 rm -rf ~/ss/g_dev
 SS_MMAP=0 SS_NP=64 SS_NQ=64 NCPU=3 "$BIN" ~/ss/dev ~/ss/g_dev 2>/dev/null
 check "dev pread np=nq=64 ncpu=3" "$($PY "$HERE/scripts/compare.py" ~/ss/g_dev "$HERE/vendor/dev-answer/dev-answer" | tail -1)" MATCH

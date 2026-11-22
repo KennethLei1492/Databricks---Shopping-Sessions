@@ -19,7 +19,7 @@ mod ts;
 use key::{pack, Key, KeyMap};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 use ts::DAY;
@@ -316,51 +316,86 @@ fn link_part(k: Key) -> usize {
 /// with key and name in the same slot (one cache miss per hit), behind a bitmap small enough to
 /// stay in cache that answers "not linked" for most other IDs without touching the table.
 struct Persons {
+    // LINK_PARTS sub-tables of 2^pshift slots each, partition = the top 6 hash bits (= link_part),
+    // linear probing inside a sub-table; filter: 2^fshift bits per partition. Partitions are
+    // built by separate tasks with no shared writes.
     slots: Vec<[u64; 2]>,
-    mask: usize,
+    pshift: u32,
+    pmask: usize,
     filter: Vec<u64>,
-    fmask: usize,
+    fshift: u32,
+    fpmask: usize,
     len: usize,
 }
 
 impl Persons {
-    fn build(pairs: &[Vec<(Key, Key)>]) -> Persons {
-        let len: usize = pairs.iter().map(|p| p.len()).sum();
-        let cap = (2 * len).next_power_of_two().max(16);
-        let bits = (16 * len).next_power_of_two().max(1024);
-        let mut persons = Persons {
-            slots: vec![[key::EMPTY, 0]; cap],
-            mask: cap - 1,
-            filter: vec![0; bits / 64],
-            fmask: bits - 1,
-            len,
-        };
-        for list in pairs {
-            for (i, &(k, name)) in list.iter().enumerate() {
-                if let Some(&(next, _)) = list.get(i + PREFETCH) {
-                    persons.prefetch_slot_always(next);
+    /// Builds the table from each partition's (non-name ID, name) pairs, one task per partition.
+    fn build(per: Vec<Vec<(Key, Key)>>, threads: usize) -> Persons {
+        assert_eq!(per.len(), LINK_PARTS);
+        let len: usize = per.iter().map(|p| p.len()).sum();
+        let max = per.iter().map(|p| p.len()).max().unwrap_or(0);
+        let pslots = (2 * max).next_power_of_two().max(16);
+        let pbits = (16 * max).next_power_of_two().max(64);
+        let mut slots: Vec<[u64; 2]> = Vec::with_capacity(LINK_PARTS * pslots);
+        let mut filter: Vec<u64> = vec![0; LINK_PARTS * pbits / 64];
+        {
+            let slot_ptr = SyncPtr(slots.as_mut_ptr());
+            let filter_ptr = SyncPtr(filter.as_mut_ptr());
+            parallel("links-table", threads, LINK_PARTS, || (), |_, p| {
+                // SAFETY: partition p owns slots [p * pslots, (p + 1) * pslots) and filter words
+                // [p * pbits / 64, (p + 1) * pbits / 64); the slot vector's capacity covers all
+                // partitions, and every slot is written (EMPTY) before any is read.
+                unsafe {
+                    let part = std::slice::from_raw_parts_mut(slot_ptr.get().add(p * pslots), pslots);
+                    part.fill([key::EMPTY, 0]);
+                    let bits = std::slice::from_raw_parts_mut(filter_ptr.get().add(p * pbits / 64), pbits / 64);
+                    for &(k, name) in &per[p] {
+                        let h = key::hash(k);
+                        debug_assert_eq!(link_part(k), p);
+                        let fb = (h >> 20) as usize & (pbits - 1);
+                        bits[fb / 64] |= 1 << (fb % 64);
+                        let mut at = h as usize & (pslots - 1);
+                        while part[at][0] != key::EMPTY {
+                            at = (at + 1) & (pslots - 1);
+                        }
+                        part[at] = [k, name];
+                    }
                 }
-                let h = key::hash(k);
-                let fb = (h >> 20) as usize & persons.fmask;
-                persons.filter[fb / 64] |= 1 << (fb % 64);
-                let mut at = h as usize & persons.mask;
-                while persons.slots[at][0] != key::EMPTY {
-                    at = (at + 1) & persons.mask;
-                }
-                persons.slots[at] = [k, name];
-            }
+            });
         }
-        persons
+        // SAFETY: every partition filled its whole slot range above.
+        unsafe { slots.set_len(LINK_PARTS * pslots) };
+        Persons {
+            slots,
+            pshift: pslots.trailing_zeros(),
+            pmask: pslots - 1,
+            filter,
+            fshift: pbits.trailing_zeros(),
+            fpmask: pbits - 1,
+            len,
+        }
+    }
+
+    /// Home slot of hash `h`: its partition's sub-table, at the hash's low bits.
+    #[inline(always)]
+    fn home(&self, h: u64) -> usize {
+        ((h >> 58) as usize) << self.pshift | (h as usize & self.pmask)
+    }
+
+    /// Filter bit of hash `h`, inside its partition's range.
+    #[inline(always)]
+    fn fbit(&self, h: u64) -> usize {
+        ((h >> 58) as usize) << self.fshift | ((h >> 20) as usize & self.fpmask)
     }
 
     #[inline(always)]
     fn get(&self, k: Key) -> Key {
         let h = key::hash(k);
-        let fb = (h >> 20) as usize & self.fmask;
+        let fb = self.fbit(h);
         if self.filter[fb / 64] >> (fb % 64) & 1 == 0 {
             return k;
         }
-        let mut at = h as usize & self.mask;
+        let mut at = self.home(h);
         loop {
             let s = self.slots[at];
             if s[0] == k {
@@ -369,14 +404,15 @@ impl Persons {
             if s[0] == key::EMPTY {
                 return k;
             }
-            at = (at + 1) & self.mask;
+            // The next slot of the same sub-table (wrapping inside it).
+            at = (at & !self.pmask) | ((at + 1) & self.pmask);
         }
     }
 
     /// First stage of a lookup pipeline: the filter word of `k`.
     #[inline(always)]
     fn prefetch_filter(&self, k: Key) {
-        let fb = (key::hash(k) >> 20) as usize & self.fmask;
+        let fb = self.fbit(key::hash(k));
         prefetch(&self.filter[fb / 64]);
     }
 
@@ -384,15 +420,10 @@ impl Persons {
     #[inline(always)]
     fn prefetch_slot(&self, k: Key) {
         let h = key::hash(k);
-        let fb = (h >> 20) as usize & self.fmask;
+        let fb = self.fbit(h);
         if self.filter[fb / 64] >> (fb % 64) & 1 != 0 {
-            prefetch(&self.slots[h as usize & self.mask]);
+            prefetch(&self.slots[self.home(h)]);
         }
-    }
-
-    #[inline(always)]
-    fn prefetch_slot_always(&self, k: Key) {
-        prefetch(&self.slots[key::hash(k) as usize & self.mask]);
     }
 
     fn len(&self) -> usize {
@@ -525,57 +556,109 @@ fn build_links(data: &Path, threads: usize) -> Persons {
     drop(parts);
     let t_fill = t0.elapsed().as_secs_f64();
 
-    // The only serial step: union by size with path halving; parent and size share a cache
-    // line, and each root keeps its component's byte-wise smallest key as it goes.
-    let mut node: Vec<[u32; 2]> = (0..n_ids as u32).map(|i| [i, 1]).collect();
-    let mut name: Vec<Key> = keys.clone();
-    #[inline(always)]
-    fn find(node: &mut [[u32; 2]], mut x: u32) -> u32 {
-        while node[x as usize][0] != x {
-            let up = node[node[x as usize][0] as usize][0];
-            node[x as usize][0] = up;
-            x = up;
+    // Union-find over all pairs on all threads (lock-free, see uf_union).
+    const RANGE: usize = 32 * 1024;
+    let parent: Vec<AtomicU32> = (0..n_ids as u32).map(AtomicU32::new).collect();
+    let pair_tasks = total.div_ceil(RANGE).max(1);
+    parallel("links-union", threads, pair_tasks, || (), |_, t| {
+        let (s, e) = (t * RANGE, ((t + 1) * RANGE).min(total));
+        for i in s..e {
+            uf_union(&parent, slot_id[2 * i], slot_id[2 * i + 1]);
         }
-        x
-    }
-    for pair in slot_id.chunks_exact(2) {
-        let ra = find(&mut node, pair[0]);
-        let rb = find(&mut node, pair[1]);
-        if ra != rb {
-            let (big, small) = if node[ra as usize][1] >= node[rb as usize][1] { (ra, rb) } else { (rb, ra) };
-            node[small as usize][0] = big;
-            node[big as usize][1] += node[small as usize][1];
-            if key::cmp(name[small as usize], name[big as usize]).is_lt() {
-                name[big as usize] = name[small as usize];
-            }
-        }
-    }
+    });
     drop(slot_id);
     let t_union = t0.elapsed().as_secs_f64();
 
-    // Roots by read-only walks (trees are shallow after union by size), fused with building
-    // each partition's map from non-name IDs to names.
-    let pair_lists = parallel("links-names", threads, LINK_PARTS, Vec::new, |out: &mut Vec<(Key, Key)>, p| {
-        let (lo, hi) = (base[p] as usize, base[p + 1] as usize);
-        for id in lo..hi {
-            let mut r = id as u32;
-            while node[r as usize][0] != r {
-                r = node[r as usize][0];
-            }
-            let nm = name[r as usize];
-            if nm != keys[id] {
-                out.push((keys[id], nm));
+    // Roots, and each component's name: its byte-wise smallest key. Fast-form keys compare as
+    // integers, so that is an atomic minimum; interned keys (rare) are compared by bytes after.
+    let id_tasks = n_ids.div_ceil(RANGE).max(1);
+    let root: Vec<AtomicU32> = (0..n_ids).map(|_| AtomicU32::new(0)).collect();
+    let name: Vec<AtomicU64> = (0..n_ids).map(|_| AtomicU64::new(u64::MAX)).collect();
+    let slow = parallel("links-roots", threads, id_tasks, Vec::new, |slow: &mut Vec<(u32, Key)>, t| {
+        let (s, e) = (t * RANGE, ((t + 1) * RANGE).min(n_ids));
+        for i in s..e {
+            let r = uf_find(&parent, i as u32);
+            root[i].store(r, Ordering::Relaxed);
+            let k = keys[i];
+            if key::is_slow(k) {
+                slow.push((r, k));
+            } else {
+                name[r as usize].fetch_min(k, Ordering::Relaxed);
             }
         }
     });
-    let persons = Persons::build(&pair_lists);
+    for list in slow {
+        for (r, k) in list {
+            let cur = name[r as usize].load(Ordering::Relaxed);
+            if cur == u64::MAX || key::cmp(k, cur).is_lt() {
+                name[r as usize].store(k, Ordering::Relaxed);
+            }
+        }
+    }
+    drop(parent);
+
+    // Per partition (its IDs are one contiguous range): the non-name IDs with their names, then
+    // the table, one task per partition.
+    let lists = parallel("links-names", threads, LINK_PARTS, Vec::new, |out: &mut Vec<(usize, Vec<(Key, Key)>)>, p| {
+        let (lo, hi) = (base[p] as usize, base[p + 1] as usize);
+        let mut pairs = Vec::new();
+        for id in lo..hi {
+            let nm = name[root[id].load(Ordering::Relaxed) as usize].load(Ordering::Relaxed);
+            if nm != keys[id] {
+                pairs.push((keys[id], nm));
+            }
+        }
+        out.push((p, pairs));
+    });
+    let mut per: Vec<Vec<(Key, Key)>> = (0..LINK_PARTS).map(|_| Vec::new()).collect();
+    for list in lists {
+        for (p, pairs) in list {
+            per[p] = pairs;
+        }
+    }
+    let persons = Persons::build(per, threads);
     eprintln!(
-        "  links: {total} pairs, {n_ids} ids; ids {t_ids:.3}s, fill {:.3}s, union-find (serial) {:.3}s, name maps {:.3}s",
+        "  links: {total} pairs, {n_ids} ids; ids {t_ids:.3}s, fill {:.3}s, union-find (parallel) {:.3}s, names + table {:.3}s",
         t_fill - t_ids,
         t_union - t_fill,
         t0.elapsed().as_secs_f64() - t_union
     );
     persons
+}
+
+/// Root of `x`, halving the path on the way (a lost compare-and-swap is harmless: another
+/// thread moved the pointer up already).
+#[inline(always)]
+fn uf_find(parent: &[AtomicU32], mut x: u32) -> u32 {
+    loop {
+        let p = parent[x as usize].load(Ordering::Acquire);
+        if p == x {
+            return x;
+        }
+        let gp = parent[p as usize].load(Ordering::Acquire);
+        if gp != p {
+            let _ = parent[x as usize].compare_exchange_weak(p, gp, Ordering::AcqRel, Ordering::Relaxed);
+        }
+        x = gp;
+    }
+}
+
+/// Lock-free union: the root with the larger index is linked under the smaller one with a
+/// compare-and-swap, so concurrent unions can never form a cycle; a lost race retries.
+#[inline(always)]
+fn uf_union(parent: &[AtomicU32], a: u32, b: u32) {
+    let (mut a, mut b) = (a, b);
+    loop {
+        a = uf_find(parent, a);
+        b = uf_find(parent, b);
+        if a == b {
+            return;
+        }
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        if parent[hi as usize].compare_exchange(hi, lo, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            return;
+        }
+    }
 }
 
 /// A raw pointer that worker threads may share, for writes to provably disjoint indices.
@@ -670,7 +753,7 @@ fn parse_event(ctx: &Ctx, r: &csv::Rec<'_, 7>) -> Option<EvRec> {
         None => u32::MAX,
     };
     let ingest_ms = ingest_both.map(|(_, ms)| ms);
-    let mut rec = EvRec { eid: key::pack_wide(r.wide(0), eid), user: 0, ingest, ts: INVALID, pc: 0 };
+    let mut rec = EvRec { eid: key::pack_wide_anon(r.wide(0), eid), user: 0, ingest, ts: INVALID, pc: 0 };
     // event_type, exactly: one integer compare on the field's window instead of byte slices.
     let ty = u64::from_le_bytes(r.wide(4)[..8].try_into().unwrap());
     let purchase = match r.len(4) {
