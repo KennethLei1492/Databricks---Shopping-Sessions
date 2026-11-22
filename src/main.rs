@@ -316,15 +316,15 @@ fn link_part(k: Key) -> usize {
 /// with key and name in the same slot (one cache miss per hit), behind a bitmap small enough to
 /// stay in cache that answers "not linked" for most other IDs without touching the table.
 struct Persons {
-    // LINK_PARTS sub-tables of 2^pshift slots each, partition = the top 6 hash bits (= link_part),
-    // linear probing inside a sub-table; filter: 2^fshift bits per partition. Partitions are
-    // built by separate tasks with no shared writes.
+    // LINK_PARTS (64) sub-tables, partition = the top 6 hash bits (= link_part), linear probing
+    // inside a sub-table; the filter has the same layout. A slot's index is the hash's top bits
+    // (partition, then the bits below it), so it is one shift: `h >> sshift`; likewise a filter
+    // bit's: `h >> fsh`. Partitions are built by separate tasks with no shared writes.
     slots: Vec<[u64; 2]>,
-    pshift: u32,
+    sshift: u32,
     pmask: usize,
     filter: Vec<u64>,
-    fshift: u32,
-    fpmask: usize,
+    fsh: u32,
     len: usize,
 }
 
@@ -332,6 +332,7 @@ impl Persons {
     /// Builds the table from each partition's (non-name ID, name) pairs, one task per partition.
     fn build(per: Vec<Vec<(Key, Key)>>, threads: usize) -> Persons {
         assert_eq!(per.len(), LINK_PARTS);
+        const { assert!(LINK_PARTS == 64) };
         let len: usize = per.iter().map(|p| p.len()).sum();
         let max = per.iter().map(|p| p.len()).max().unwrap_or(0);
         let pslots = (2 * max).next_power_of_two().max(16);
@@ -352,9 +353,9 @@ impl Persons {
                     for &(k, name) in &per[p] {
                         let h = key::hash(k);
                         debug_assert_eq!(link_part(k), p);
-                        let fb = (h >> 20) as usize & (pbits - 1);
+                        let fb = (h >> (58 - pbits.trailing_zeros())) as usize & (pbits - 1);
                         bits[fb / 64] |= 1 << (fb % 64);
-                        let mut at = h as usize & (pslots - 1);
+                        let mut at = (h >> (58 - pslots.trailing_zeros())) as usize & (pslots - 1);
                         while part[at][0] != key::EMPTY {
                             at = (at + 1) & (pslots - 1);
                         }
@@ -365,39 +366,39 @@ impl Persons {
         }
         // SAFETY: every partition filled its whole slot range above.
         unsafe { slots.set_len(LINK_PARTS * pslots) };
-        Persons {
-            slots,
-            pshift: pslots.trailing_zeros(),
-            pmask: pslots - 1,
-            filter,
-            fshift: pbits.trailing_zeros(),
-            fpmask: pbits - 1,
-            len,
-        }
+        Persons { slots, sshift: 58 - pslots.trailing_zeros(), pmask: pslots - 1, filter, fsh: 58 - pbits.trailing_zeros(), len }
     }
 
-    /// Home slot of hash `h`: its partition's sub-table, at the hash's low bits.
+    /// Home slot of hash `h` (below slots.len(): 6 + log2(slots per partition) bits).
     #[inline(always)]
     fn home(&self, h: u64) -> usize {
-        ((h >> 58) as usize) << self.pshift | (h as usize & self.pmask)
+        (h >> self.sshift) as usize
     }
 
-    /// Filter bit of hash `h`, inside its partition's range.
+    /// Filter bit of hash `h` (below 64 * filter.len()).
     #[inline(always)]
     fn fbit(&self, h: u64) -> usize {
-        ((h >> 58) as usize) << self.fshift | ((h >> 20) as usize & self.fpmask)
+        (h >> self.fsh) as usize
+    }
+
+    /// Whether the filter says `h`'s key may be linked.
+    #[inline(always)]
+    fn maybe(&self, h: u64) -> bool {
+        let fb = self.fbit(h);
+        // SAFETY: fb / 64 < filter.len() (see fbit).
+        unsafe { *self.filter.get_unchecked(fb / 64) >> (fb % 64) & 1 != 0 }
     }
 
     #[inline(always)]
     fn get(&self, k: Key) -> Key {
         let h = key::hash(k);
-        let fb = self.fbit(h);
-        if self.filter[fb / 64] >> (fb % 64) & 1 == 0 {
+        if !self.maybe(h) {
             return k;
         }
         let mut at = self.home(h);
         loop {
-            let s = self.slots[at];
+            // SAFETY: at < slots.len() (home, then wrapping inside its partition).
+            let s = unsafe { *self.slots.get_unchecked(at) };
             if s[0] == k {
                 return s[1];
             }
@@ -413,16 +414,17 @@ impl Persons {
     #[inline(always)]
     fn prefetch_filter(&self, k: Key) {
         let fb = self.fbit(key::hash(k));
-        prefetch(&self.filter[fb / 64]);
+        // SAFETY: fb / 64 < filter.len() (see fbit).
+        prefetch(unsafe { self.filter.get_unchecked(fb / 64) });
     }
 
     /// Second stage: the table slot of `k`, if the filter says it may be linked.
     #[inline(always)]
     fn prefetch_slot(&self, k: Key) {
         let h = key::hash(k);
-        let fb = self.fbit(h);
-        if self.filter[fb / 64] >> (fb % 64) & 1 != 0 {
-            prefetch(&self.slots[self.home(h)]);
+        if self.maybe(h) {
+            // SAFETY: home(h) < slots.len().
+            prefetch(unsafe { self.slots.get_unchecked(self.home(h)) });
         }
     }
 
@@ -1142,7 +1144,7 @@ fn main() {
     let np: usize = std::env::var("SS_NP")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or((events_in.bytes() / 76 / 8192).next_power_of_two())
+        .unwrap_or((events_in.bytes() / 76 / 8192).next_power_of_two().min(2048))
         .clamp(64, 4096);
     // Capacities with headroom: a doubling copy of a big array costs far more than slack.
     let pay_estimate = events_in.bytes() / 56 / threads + 64;
@@ -1305,7 +1307,7 @@ fn main() {
     let nq: usize = std::env::var("SS_NQ")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or((events_in.bytes() / 76 / 16384).next_power_of_two())
+        .unwrap_or((events_in.bytes() / 76 / 16384).next_power_of_two().min(1024))
         .clamp(64, 4096);
     let regrouped = parallel(
         "regroup",
