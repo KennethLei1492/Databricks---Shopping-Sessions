@@ -11,7 +11,7 @@ fail=0
 check() { echo "$1: $2"; [ "$2" = "$3" ] || fail=1; }
 
 check fixtures "$($PY "$HERE/scripts/run_fixtures.py" "$HERE/fixtures" -- "$BIN" 2>&1 | tail -1)" "36/36 fixtures passed"
-check fixtures-pread "$(SS_MMAP=0 $PY "$HERE/scripts/run_fixtures.py" "$HERE/fixtures" -- "$BIN" 2>&1 | tail -1)" "36/36 fixtures passed"
+check fixtures-mmap "$(SS_MMAP=2 $PY "$HERE/scripts/run_fixtures.py" "$HERE/fixtures" -- "$BIN" 2>&1 | tail -1)" "36/36 fixtures passed"
 for c in 262144 333 70; do
   rm -rf ~/ss/g_dev
   SS_CHUNK=$c "$BIN" ~/ss/dev ~/ss/g_dev 2>/dev/null
@@ -24,8 +24,8 @@ if [ -d "${DEV2:-$HOME/ss/dev5}" ] && [ -d "${ANS2:-$HOME/ss/dl_v5/ans/dev-answe
   check "dev v5" "$($PY "$HERE/scripts/compare.py" ~/ss/g_dev "${ANS2:-$HOME/ss/dl_v5/ans/dev-answer}" | tail -1)" MATCH
 fi
 rm -rf ~/ss/g_dev
-SS_MMAP=0 SS_NP=64 SS_NQ=64 NCPU=3 "$BIN" ~/ss/dev ~/ss/g_dev 2>/dev/null
-check "dev pread np=nq=64 ncpu=3" "$($PY "$HERE/scripts/compare.py" ~/ss/g_dev "$HERE/vendor/dev-answer/dev-answer" | tail -1)" MATCH
+SS_MMAP=2 SS_NP=64 SS_NQ=64 NCPU=3 "$BIN" ~/ss/dev ~/ss/g_dev 2>/dev/null
+check "dev mmap np=nq=64 ncpu=3" "$($PY "$HERE/scripts/compare.py" ~/ss/g_dev "$HERE/vendor/dev-answer/dev-answer" | tail -1)" MATCH
 out=$(BIN=$BIN WORK=~/ss/g_nv bash "$HERE/scripts/nversion.sh" 300000 $SEEDS 2>&1)
 echo "$out"
 [ "$(echo "$out" | grep -c ': MATCH$')" = "$(echo $SEEDS | wc -w)" ] || fail=1

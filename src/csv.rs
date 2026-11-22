@@ -9,11 +9,12 @@ use std::path::{Path, PathBuf};
 
 const NL: u8 = 10;
 
-/// Input files, memory-mapped and parsed in place (no copy into user buffers). Each chunk's
-/// pages are mapped in one call (MADV_POPULATE_READ, ignored where unsupported) just before it is
-/// parsed. `SS_MMAP=1` skips that call; `SS_MMAP=0` reads with `pread` into per-thread buffers,
-/// which is also how the last bytes of each file are read (the parser needs SLACK bytes after
-/// a chunk).
+/// Input files, read with `pread` into a reused per-thread buffer that stays in cache (the
+/// default, `SS_MMAP=0`), or memory-mapped and parsed in place (`SS_MMAP=2`: each chunk's pages
+/// mapped in one MADV_POPULATE_READ call just before it is parsed; `SS_MMAP=1` without that call).
+/// Reading leaves no file mappings for the kernel to tear down, page by page and on one thread,
+/// when the process exits: about 16 ms per GB of input here. The last bytes of each file are
+/// always read with `pread` (the parser needs SLACK bytes after a chunk).
 pub struct Input {
     files: Vec<File>,
     sizes: Vec<usize>,
@@ -55,7 +56,7 @@ pub fn list_csv(dir: &Path) -> Vec<PathBuf> {
 
 impl Input {
     pub fn open(paths: &[PathBuf]) -> Input {
-        let mode: u32 = std::env::var("SS_MMAP").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+        let mode: u32 = std::env::var("SS_MMAP").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         let mut files = Vec::new();
         let mut sizes = Vec::new();
         let mut maps = Vec::new();

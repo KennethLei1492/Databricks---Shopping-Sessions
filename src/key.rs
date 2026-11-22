@@ -248,15 +248,16 @@ fn record(k: Key, s: &[u8]) {
 }
 
 /// Slow keys a thread made with `pack_wide` and the strings behind them, kept on the thread so
-/// parsing takes no lock: a set of the keys it has seen (open addressing, 0 = empty, which no
-/// slow key is) and the first occurrence of each. When the thread ends they move to PENDING;
-/// `publish` puts them in the dictionary before anything reads names.
+/// parsing takes no lock: an open-addressing table of (key, offset, length) slots (key 0 = empty,
+/// which no slow key is) over an arena holding the first occurrence of each string. When the
+/// thread ends the table moves to PENDING; `publish` makes the tables readable by every thread,
+/// and `find` looks a key up in them. Nothing is copied or merged: a key seen by several threads
+/// is in several tables, and any of them gives its string.
 #[derive(Default)]
 struct Local {
-    seen: Vec<u64>,
+    seen: Vec<(u64, u32, u32)>,
     n: usize,
     arena: Vec<u8>,
-    entries: Vec<(Key, u32, u32)>,
 }
 
 impl Local {
@@ -268,14 +269,13 @@ impl Local {
         let mask = self.seen.len() - 1;
         let mut at = k as usize & mask;
         loop {
-            let v = self.seen[at];
+            let v = self.seen[at].0;
             if v == k {
                 return;
             }
             if v == 0 {
-                self.seen[at] = k;
+                self.seen[at] = (k, self.arena.len() as u32, s.len() as u32);
                 self.n += 1;
-                self.entries.push((k, self.arena.len() as u32, s.len() as u32));
                 self.arena.extend_from_slice(s);
                 return;
             }
@@ -286,14 +286,33 @@ impl Local {
     #[cold]
     fn grow(&mut self) {
         let cap = (self.seen.len() * 2).max(1 << 12);
-        let old = std::mem::replace(&mut self.seen, vec![0; cap]);
+        let old = std::mem::replace(&mut self.seen, vec![(0, 0, 0); cap]);
         let mask = cap - 1;
-        for k in old.into_iter().filter(|&k| k != 0) {
-            let mut at = k as usize & mask;
-            while self.seen[at] != 0 {
+        for slot in old.into_iter().filter(|s| s.0 != 0) {
+            let mut at = slot.0 as usize & mask;
+            while self.seen[at].0 != 0 {
                 at = (at + 1) & mask;
             }
-            self.seen[at] = k;
+            self.seen[at] = slot;
+        }
+    }
+
+    /// The string noted under `k`, if this thread noted it.
+    fn find(&self, k: Key) -> Option<&[u8]> {
+        if self.seen.is_empty() {
+            return None;
+        }
+        let mask = self.seen.len() - 1;
+        let mut at = k as usize & mask;
+        loop {
+            let (v, off, n) = self.seen[at];
+            if v == k {
+                return Some(&self.arena[off as usize..(off + n) as usize]);
+            }
+            if v == 0 {
+                return None;
+            }
+            at = (at + 1) & mask;
         }
     }
 }
@@ -302,37 +321,41 @@ struct LocalCell(Local);
 
 impl Drop for LocalCell {
     fn drop(&mut self) {
-        if !self.0.entries.is_empty() {
-            let mut local = std::mem::take(&mut self.0);
-            local.seen = Vec::new();
-            PENDING.lock().unwrap().push(local);
+        if self.0.n > 0 {
+            PENDING.lock().unwrap().push(std::mem::take(&mut self.0));
         }
     }
 }
 
 static PENDING: Mutex<Vec<Local>> = Mutex::new(Vec::new());
 
+/// The tables of threads that ended before the last `publish`, readable by all.
+static PUBLISHED: std::sync::RwLock<Vec<Local>> = std::sync::RwLock::new(Vec::new());
+
 thread_local! {
     static LOCAL: std::cell::RefCell<LocalCell> = std::cell::RefCell::new(LocalCell(Local::default()));
 }
 
-/// Puts every pending string (from threads that have ended) in the
-/// dictionary, on `threads` threads. Must run before `bytes`/`cmp`/`append_bytes` read a key made
-/// by `pack_wide`.
-pub fn publish(threads: usize) {
+/// Makes the strings noted by threads that have ended readable by `bytes`/`cmp`/`append_bytes`
+/// (which must not see a `pack_wide` key before this). It only moves the tables: the few keys
+/// whose strings are ever read (output names, equal-time click tie-breaks) are looked up in them
+/// on demand, instead of merging every noted key into the dictionary on the critical path.
+pub fn publish(_threads: usize) {
     let lists = std::mem::take(&mut *PENDING.lock().unwrap());
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        for _ in 0..threads.max(1) {
-            scope.spawn(|| loop {
-                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some(list) = lists.get(i) else { break };
-                for &(k, at, n) in &list.entries {
-                    record(k, &list.arena[at as usize..(at + n) as usize]);
-                }
-            });
+    PUBLISHED.write().unwrap().extend(lists);
+}
+
+/// The string behind slow key `k`: the dictionary (keys made by `pack`), then the published
+/// per-thread tables (keys made by `pack_wide`).
+fn with_slow<R>(k: Key, f: impl FnOnce(Option<&[u8]>) -> R) -> R {
+    {
+        let shard = dict()[shard_of(k)].lock().unwrap();
+        if let Some(&(at, n)) = shard.at.get(&k) {
+            return f(Some(&shard.arena[at as usize..(at + n) as usize]));
         }
-    });
+    }
+    let tables = PUBLISHED.read().unwrap();
+    f(tables.iter().find_map(|t| t.find(k)))
 }
 
 #[inline(always)]
@@ -350,13 +373,12 @@ pub fn bytes(k: Key) -> Vec<u8> {
 #[inline]
 pub fn append_bytes(k: Key, out: &mut Vec<u8>) {
     if is_slow(k) {
-        let shard = dict()[shard_of(k)].lock().unwrap();
-        match shard.at.get(&k) {
-            Some(&(at, n)) => out.extend_from_slice(&shard.arena[at as usize..(at + n) as usize]),
+        with_slow(k, |found| match found {
+            Some(bytes) => out.extend_from_slice(bytes),
             // A replica's shifted long ID (SS_REPLICATE benchmarking only).
             None if cfg!(feature = "scale") => out.extend_from_slice(format!("~{k:016x}").as_bytes()),
             None => panic!("slow key without a dictionary entry"),
-        }
+        })
     } else {
         // All ten codes into a stack buffer, then one copy of the non-padding prefix.
         let mut buf = [0u8; MAX_FAST];
