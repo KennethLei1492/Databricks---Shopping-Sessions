@@ -13,6 +13,11 @@ memchr = "2.8.3"
 memmap2 = "0.9.12"
 mimalloc = { version = "0.1.52", default-features = false }
 
+[features]
+# SS_REPLICATE: parse the input several times over with shifted IDs, to measure at the practice
+# set's scale from the dev set (scripts/scale_bench.sh). Off in the submitted build.
+scale = []
+
 [profile.release]
 opt-level = 3
 lto = "fat"

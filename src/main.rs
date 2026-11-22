@@ -438,10 +438,15 @@ fn build_links(data: &Path, threads: usize) -> Persons {
         || LinkState { buf: Vec::new(), pairs: Vec::new() },
         |st, i| {
             let LinkState { buf, pairs } = st;
+            let copy = chunks[i].copy;
             input.records::<2>(chunks[i], buf, |r| {
                 let [a, b] = r.fields();
                 if !a.is_empty() && !b.is_empty() {
-                    pairs.push((pack(a), pack(b)));
+                    if cfg!(feature = "scale") && copy != 0 {
+                        pairs.push((key::salt(pack(a), copy), key::salt(pack(b), copy)));
+                    } else {
+                        pairs.push((pack(a), pack(b)));
+                    }
                 }
             });
         },
@@ -1082,15 +1087,34 @@ fn main() {
             },
             |st, task| {
                 let ParseState { thread, buf, events, payload, clicks } = st;
+                // A replica (SS_REPLICATE benchmarking) shifts its IDs in a loop of its own, so the
+                // normal loop is unchanged.
                 if task < ev_chunks.len() {
-                    events_in.records::<7>(ev_chunks[task], buf, |f| {
-                        if let Some(rec) = parse_event(&ctx, f) {
-                            push_event(&rec, *thread, payload, events, np);
-                        }
-                    });
+                    let chunk = ev_chunks[task];
+                    if !cfg!(feature = "scale") || chunk.copy == 0 {
+                        events_in.records::<7>(chunk, buf, |f| {
+                            if let Some(rec) = parse_event(&ctx, f) {
+                                push_event(&rec, *thread, payload, events, np);
+                            }
+                        });
+                    } else {
+                        events_in.records::<7>(chunk, buf, |f| {
+                            if let Some(mut rec) = parse_event(&ctx, f) {
+                                rec.eid = key::salt(rec.eid, chunk.copy);
+                                rec.user = key::salt(rec.user, chunk.copy);
+                                push_event(&rec, *thread, payload, events, np);
+                            }
+                        });
+                    }
                 } else {
-                    clicks_in.records::<4>(ck_chunks[task - ev_chunks.len()], buf, |f| {
-                        if let Some(rec) = parse_click(&ctx, f) {
+                    let chunk = ck_chunks[task - ev_chunks.len()];
+                    let shifted = cfg!(feature = "scale") && chunk.copy != 0;
+                    clicks_in.records::<4>(chunk, buf, |f| {
+                        if let Some(mut rec) = parse_click(&ctx, f) {
+                            if shifted {
+                                rec.person = key::salt(rec.person, chunk.copy);
+                                rec.cid = key::salt(rec.cid, chunk.copy);
+                            }
                             clicks.push(rec);
                         }
                     });
