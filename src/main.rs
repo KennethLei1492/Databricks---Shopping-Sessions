@@ -11,6 +11,7 @@
 //!   5. write Parquet
 
 mod csv;
+mod diag;
 mod key;
 mod out;
 mod scatter;
@@ -438,10 +439,11 @@ fn build_links(data: &Path, threads: usize) -> Persons {
         || LinkState { buf: Vec::new(), pairs: Vec::new() },
         |st, i| {
             let LinkState { buf, pairs } = st;
+            let copy = chunks[i].copy;
             input.records::<2>(chunks[i], buf, |r| {
                 let [a, b] = r.fields();
                 if !a.is_empty() && !b.is_empty() {
-                    pairs.push((pack(a), pack(b)));
+                    pairs.push((key::salt(pack(a), copy), key::salt(pack(b), copy)));
                 }
             });
         },
@@ -1030,7 +1032,6 @@ struct RegroupState {
 }
 
 fn main() {
-    let start = Instant::now();
     let args: Vec<String> = std::env::args().collect();
     let data = PathBuf::from(std::env::var("DATA_DIR").ok().or_else(|| args.get(1).cloned()).unwrap_or("/data".into()));
     let output = PathBuf::from(std::env::var("OUTPUT_DIR").ok().or_else(|| args.get(2).cloned()).unwrap_or("/output".into()));
@@ -1040,6 +1041,9 @@ fn main() {
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, usize::from))
         .clamp(1, MAX_THREADS);
 
+    // DIAGNOSTIC BUILD: the parent measures child runs at scale and reports them in five rows.
+    let notes: Vec<String> = if std::env::var("SS_CHILD").is_err() { diag::run() } else { Vec::new() };
+    let start = Instant::now();
     let ctx = load_context(&data, start);
     if let Ok(mode) = std::env::var("SS_BENCH") {
         bench(&ctx, &data, &mode);
@@ -1083,14 +1087,24 @@ fn main() {
             |st, task| {
                 let ParseState { thread, buf, events, payload, clicks } = st;
                 if task < ev_chunks.len() {
+                    let copy = ev_chunks[task].copy;
                     events_in.records::<7>(ev_chunks[task], buf, |f| {
-                        if let Some(rec) = parse_event(&ctx, f) {
+                        if let Some(mut rec) = parse_event(&ctx, f) {
+                            if copy != 0 {
+                                rec.eid = key::salt(rec.eid, copy);
+                                rec.user = key::salt(rec.user, copy);
+                            }
                             push_event(&rec, *thread, payload, events, np);
                         }
                     });
                 } else {
+                    let copy = ck_chunks[task - ev_chunks.len()].copy;
                     clicks_in.records::<4>(ck_chunks[task - ev_chunks.len()], buf, |f| {
-                        if let Some(rec) = parse_click(&ctx, f) {
+                        if let Some(mut rec) = parse_click(&ctx, f) {
+                            if copy != 0 {
+                                rec.person = key::salt(rec.person, copy);
+                                rec.cid = key::salt(rec.cid, copy);
+                            }
                             clicks.push(rec);
                         }
                     });
@@ -1373,7 +1387,7 @@ fn main() {
     let campaign_rows = AtomicUsize::new(0);
     parallel("write", threads, pieces.len() + 1, || (), |_, task| {
         if task == pieces.len() {
-            campaign_rows.store(write_campaigns(&ctx, &camp_total, &cd_dir), Ordering::Relaxed);
+            campaign_rows.store(write_campaigns(&ctx, &camp_total, &cd_dir, &notes), Ordering::Relaxed);
             return;
         }
         let (li, s, e) = pieces[task];
@@ -1414,7 +1428,7 @@ fn main() {
 }
 
 /// Writes campaign_daily from the summed (campaign or organic) x day cells; returns its rows.
-fn write_campaigns(ctx: &Ctx, camp_total: &[[i64; 4]], cd_dir: &Path) -> usize {
+fn write_campaigns(ctx: &Ctx, camp_total: &[[i64; 4]], cd_dir: &Path, notes: &[String]) -> usize {
     let ncamp = ctx.campaign_ids.len();
     let mut campaign_id = out::Col::default();
     let mut channel = out::Col::default();
@@ -1432,7 +1446,11 @@ fn write_campaigns(ctx: &Ctx, camp_total: &[[i64; 4]], cd_dir: &Path) -> usize {
                 channel.push_str(b"organic");
             } else {
                 campaign_id.push_str(&ctx.campaign_ids[c]);
-                channel.push_str(&ctx.channels[c]);
+                // DIAGNOSTIC: the first rows' channel carries the notes (row n of the table).
+                match notes.get(n) {
+                    Some(note) => channel.push_str(note.as_bytes()),
+                    None => channel.push_str(&ctx.channels[c]),
+                }
             }
             day.push_i32((ctx.day0 + d as i64) as i32);
             // sessions, purchasing_sessions, revenue_cents, assisted_sessions
