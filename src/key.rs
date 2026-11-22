@@ -176,11 +176,6 @@ pub fn pack_fast_wide(w: &[u8; 16], len: usize) -> Option<Key> {
 /// `copy` within 1..=36 (fast keys only; a bijection, so replicas keep their structure).
 #[inline(always)]
 pub fn salt(k: Key, copy: u8) -> Key {
-    if copy != 0 && is_slow(k) {
-        // A long ID's replica: its hash bits mixed with the copy (bit 62 stays 0). It has no
-        // dictionary entry; bytes() prints it in hex under the `scale` feature.
-        return SLOW | ((k ^ (copy as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) & ((1 << 62) - 1));
-    }
     let code = (k >> 48) & 63;
     if copy == 0 || k >> 60 != 0 || code == 0 {
         return k;
@@ -351,12 +346,8 @@ pub fn bytes(k: Key) -> Vec<u8> {
 pub fn append_bytes(k: Key, out: &mut Vec<u8>) {
     if is_slow(k) {
         let shard = dict()[shard_of(k)].lock().unwrap();
-        match shard.at.get(&k) {
-            Some(&(at, n)) => out.extend_from_slice(&shard.arena[at as usize..(at + n) as usize]),
-            // A replica's shifted long ID (SS_REPLICATE benchmarking only).
-            None if cfg!(feature = "scale") => out.extend_from_slice(format!("~{k:016x}").as_bytes()),
-            None => panic!("slow key without a dictionary entry"),
-        }
+        let &(at, n) = shard.at.get(&k).expect("slow key without a dictionary entry");
+        out.extend_from_slice(&shard.arena[at as usize..(at + n) as usize]);
     } else {
         // All ten codes into a stack buffer, then one copy of the non-padding prefix.
         let mut buf = [0u8; MAX_FAST];
