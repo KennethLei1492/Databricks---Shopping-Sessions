@@ -57,6 +57,22 @@ byte-wise order; any other string goes through a small global interner (`src/key
 | 6b69637 | bucket(): multiply-shift instead of a 64-bit DIV per event and click | 1.08 s | invisible to cachegrind (DIV counts as one instruction) |
 | ac6e334 | windowed campaign/product lookup; trusted F1 ingest_ts | 1.04 s | -3.2% instructions |
 
+Rescored on the generator v5 data (scorer shopping-sessions-5: ~20M events, 1 ID in 8 long):
+
+| Commit | Change | Scorer | Local evidence |
+| --- | --- | --- | --- |
+| 1fd5741 | long IDs as hash keys, no interner | 1.1037 s | |
+| 52ab0c9 | long IDs noted per thread, published after parse | 1.0672 s | lock contention gone |
+| 9eeddd8 | same source as 52ab0c9 | 1.0819 s | scorer noise on identical code |
+| 10286ba | person lookups one shift, no bounds checks (157059e); sessions bins hashed once | 1.0275 s | -3.3% and -0.7% instructions |
+| 91d920e | payloads and clicks filed per link partition, regrouped partition by partition | 1.1183 s | cost model -3.4% on 5M events; reverted in the next commit |
+
+91d920e is the third change the single-thread cost model approved that the scorer rejected
+(after faeaf07 and b54186b). It replaced each parse thread's one sequential payload array with
+64 lists (and 64 click lists), so parse writes 128 more streams and regroup reads many small
+ranges. The model saw fewer cache misses in regroup; the 8-thread scorer ran 9% slower. Changes
+that add write streams or split sequential arrays in parse need the scorer, not the model.
+
 Tried and dropped (cost model, dev set, no scorer run needed):
 
 - One-pass 64-byte block splitter (separator entries tagged by PEXT, newline ranks): correct on
