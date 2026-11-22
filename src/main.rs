@@ -1381,15 +1381,15 @@ fn main() {
         let n = rows.len();
         let mut user_id = out::Col::with_capacity(n * 16);
         let mut day = out::Col::with_capacity(n * 4);
-        let mut sessions = out::Col::with_capacity(n * 8);
-        let mut events = out::Col::with_capacity(n * 8);
+        let mut sessions = out::Col::with_capacity(n * 4);
+        let mut events = out::Col::with_capacity(n * 4);
         let mut revenue = out::Col::with_capacity(n * 8);
         let mut top = out::Col::with_capacity(n * 4);
         for (i, r) in rows.iter().enumerate() {
             user_id.push_str_with(|buf| key::append_bytes(r.person, buf));
             day.push_i32(r.day);
-            sessions.push_i64(r.sessions);
-            events.push_i64(r.events);
+            sessions.push_count(r.sessions);
+            events.push_count(r.events);
             revenue.push_i64(r.revenue);
             let present = r.top != NO_CATEGORY;
             top.set_present(i, present);
@@ -1435,8 +1435,13 @@ fn write_campaigns(ctx: &Ctx, camp_total: &[[i64; 4]], cd_dir: &Path) -> usize {
                 channel.push_str(&ctx.channels[c]);
             }
             day.push_i32((ctx.day0 + d as i64) as i32);
+            // sessions, purchasing_sessions, revenue_cents, assisted_sessions
             for k in 0..4 {
-                cols[k].push_i64(cell[k]);
+                if k == 2 {
+                    cols[k].push_i64(cell[k]);
+                } else {
+                    cols[k].push_count(cell[k]);
+                }
             }
             n += 1;
         }

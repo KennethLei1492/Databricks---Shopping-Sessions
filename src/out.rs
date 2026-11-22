@@ -10,6 +10,7 @@
 pub enum Kind {
     Str,
     Date,
+    I32,
     I64,
 }
 
@@ -26,8 +27,8 @@ const fn spec(name: &'static str, kind: Kind, optional: bool) -> Spec {
 pub const USER: [Spec; 6] = [
     spec("user_id", Kind::Str, false),
     spec("day", Kind::Date, false),
-    spec("sessions", Kind::I64, false),
-    spec("events", Kind::I64, false),
+    spec("sessions", Kind::I32, false),
+    spec("events", Kind::I32, false),
     spec("revenue_cents", Kind::I64, false),
     spec("top_category", Kind::Str, true),
 ];
@@ -36,10 +37,10 @@ pub const CAMPAIGN: [Spec; 7] = [
     spec("campaign_id", Kind::Str, false),
     spec("channel", Kind::Str, false),
     spec("day", Kind::Date, false),
-    spec("sessions", Kind::I64, false),
-    spec("purchasing_sessions", Kind::I64, false),
+    spec("sessions", Kind::I32, false),
+    spec("purchasing_sessions", Kind::I32, false),
     spec("revenue_cents", Kind::I64, false),
-    spec("assisted_sessions", Kind::I64, false),
+    spec("assisted_sessions", Kind::I32, false),
 ];
 
 /// One column's page body: the PLAIN values of its present rows, and for an optional column a
@@ -58,6 +59,14 @@ impl Col {
     #[inline(always)]
     pub fn push_i32(&mut self, v: i32) {
         self.values.extend_from_slice(&v.to_le_bytes());
+    }
+
+    /// A count; rules.md accepts any integer width, and counts per person-day or campaign-day
+    /// are far below 2^31 (checked in debug builds).
+    #[inline(always)]
+    pub fn push_count(&mut self, v: i64) {
+        debug_assert!(i32::try_from(v).is_ok());
+        self.push_i32(v as i32);
     }
 
     #[inline(always)]
@@ -198,7 +207,7 @@ const PAGE_DATA: i32 = 0;
 fn physical(kind: Kind) -> i32 {
     match kind {
         Kind::Str => TYPE_BYTE_ARRAY,
-        Kind::Date => TYPE_INT32,
+        Kind::Date | Kind::I32 => TYPE_INT32,
         Kind::I64 => TYPE_INT64,
     }
 }
@@ -275,7 +284,7 @@ pub fn write(path: &std::path::Path, root: &str, specs: &[Spec], cols: &[Col], r
                 t.end();
                 t.end();
             }
-            Kind::I64 => {}
+            Kind::I32 | Kind::I64 => {}
         }
         t.end();
     }
