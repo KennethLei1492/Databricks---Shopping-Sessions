@@ -200,9 +200,6 @@ fn cpu_now() -> (f64, f64, i64) {
     }
 }
 
-static INIT_MAX: AtomicU64 = AtomicU64::new(0);
-static SPAWN_MAX: AtomicU64 = AtomicU64::new(0);
-
 fn parallel<S: Send>(
     name: &str,
     threads: usize,
@@ -211,19 +208,15 @@ fn parallel<S: Send>(
     work: impl Fn(&mut S, usize) + Sync,
 ) -> Vec<S> {
     let next = AtomicUsize::new(0);
-    INIT_MAX.store(0, Ordering::Relaxed);
-    SPAWN_MAX.store(0, Ordering::Relaxed);
     let cpu0 = cpu_now();
     let t0 = Instant::now();
-    let results: Vec<(S, f64, f64, usize, f64)> = std::thread::scope(|scope| {
+    let results: Vec<(S, f64, f64, usize, f64, f64)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|_| {
                 scope.spawn(|| {
                     let spawned = t0.elapsed().as_secs_f64();
                     let mut state = init();
                     let started = t0.elapsed().as_secs_f64();
-                    INIT_MAX.fetch_max(((started - spawned) * 1e6) as u64, Ordering::Relaxed);
-                    SPAWN_MAX.fetch_max((spawned * 1e6) as u64, Ordering::Relaxed);
                     let (mut busy, mut longest, mut longest_task) = (0f64, 0f64, 0usize);
                     loop {
                         let task = next.fetch_add(1, Ordering::Relaxed);
@@ -239,7 +232,7 @@ fn parallel<S: Send>(
                             longest_task = task;
                         }
                     }
-                    (state, busy, longest, longest_task, started)
+                    (state, busy, longest, longest_task, started, spawned)
                 })
             })
             .collect();
@@ -249,6 +242,8 @@ fn parallel<S: Send>(
     let busy: f64 = results.iter().map(|r| r.1).sum();
     let (longest, longest_task) = results.iter().map(|r| (r.2, r.3)).fold((0f64, 0), |a, b| if b.0 > a.0 { b } else { a });
     let slowest_start = results.iter().map(|r| r.4).fold(0f64, f64::max);
+    let slowest_spawn = results.iter().map(|r| r.5).fold(0f64, f64::max);
+    let slowest_init = results.iter().map(|r| r.4 - r.5).fold(0f64, f64::max);
     let cpu1 = cpu_now();
     eprintln!(
         "  phase {name}: {n} tasks, wall {wall:.3}s, utilization {:.0}%, user {:.3}s, kernel {:.3}s, faults {}k, longest task #{longest_task} {longest:.3}s, slowest thread start {slowest_start:.3}s (spawn {:.3}s, init {:.3}s)",
@@ -256,8 +251,8 @@ fn parallel<S: Send>(
         cpu1.0 - cpu0.0,
         cpu1.1 - cpu0.1,
         (cpu1.2 - cpu0.2) / 1000,
-        SPAWN_MAX.load(Ordering::Relaxed) as f64 / 1e6,
-        INIT_MAX.load(Ordering::Relaxed) as f64 / 1e6
+        slowest_spawn,
+        slowest_init
     );
     results.into_iter().map(|r| r.0).collect()
 }
