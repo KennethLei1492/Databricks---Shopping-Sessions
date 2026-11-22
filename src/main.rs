@@ -1125,6 +1125,40 @@ struct ParseState {
     events: scatter::Scatter<DedupRec, 4>,
     payload: Vec<Pay>,
     clicks: Vec<ClickRec>,
+    // Payload entries from this index on hold the person, not the user ID: the person table was
+    // ready when the thread parsed them (see `resolve_step`). usize::MAX until then.
+    resolved_from: usize,
+}
+
+/// Lookups run `RESOLVE_LAG` events behind parsing: the filter word of a new entry is prefetched
+/// when it is pushed, its table slot `RESOLVE_LAG / 2` events later and the lookup done after
+/// `RESOLVE_LAG`, so the memory waits overlap the parsing of the events in between.
+const RESOLVE_LAG: usize = 8;
+
+/// One step of the in-parse person lookups, after an entry was pushed onto `payload` (entries
+/// from `base` on belong to the current chunk).
+#[inline(always)]
+fn resolve_step(persons: &Persons, payload: &mut [Pay], base: usize) {
+    let at = payload.len() - 1;
+    // SAFETY: at < payload.len(), and the lagged indices are checked to be >= base >= 0.
+    unsafe {
+        persons.prefetch_filter(payload.get_unchecked(at).user);
+        if at >= base + RESOLVE_LAG / 2 {
+            persons.prefetch_slot(payload.get_unchecked(at - RESOLVE_LAG / 2).user);
+        }
+        if at >= base + RESOLVE_LAG {
+            let e = payload.get_unchecked_mut(at - RESOLVE_LAG);
+            e.user = persons.get(e.user);
+        }
+    }
+}
+
+/// The chunk's last entries, which `resolve_step` had not reached.
+fn resolve_tail(persons: &Persons, payload: &mut [Pay], base: usize) {
+    let n = payload.len();
+    for e in &mut payload[n.saturating_sub(RESOLVE_LAG).max(base)..] {
+        e.user = persons.get(e.user);
+    }
 }
 
 struct DedupState {
@@ -1177,11 +1211,14 @@ fn main() {
 
     // ---- parse events and clicks on the pool; links (which parsing does not need) alongside
     let thread_ids = AtomicUsize::new(0);
-    let (parsed, persons) = std::thread::scope(|scope| {
-        let links = scope.spawn(|| {
+    // The person table, once links are done: parse threads then look up each event's person
+    // as they go (overlapping the memory waits with parsing), and regroup skips those events.
+    let persons_cell: std::sync::OnceLock<Persons> = std::sync::OnceLock::new();
+    let parsed = std::thread::scope(|scope| {
+        scope.spawn(|| {
             let persons = build_links(&data, threads.min(2));
             log(start, &format!("links: {} non-name IDs mapped", persons.len()));
-            persons
+            let _ = persons_cell.set(persons);
         });
         let parsed = parallel(
             "parse",
@@ -1193,27 +1230,52 @@ fn main() {
                 events: scatter::Scatter::new(np),
                 payload: Vec::with_capacity(pay_estimate),
                 clicks: Vec::with_capacity(ck_estimate),
+                resolved_from: usize::MAX,
             },
             |st, task| {
-                let ParseState { thread, buf, events, payload, clicks } = st;
+                let ParseState { thread, buf, events, payload, clicks, resolved_from } = st;
                 // A replica (SS_REPLICATE benchmarking) shifts its IDs in a loop of its own, so the
                 // normal loop is unchanged.
                 if task < ev_chunks.len() {
                     let chunk = ev_chunks[task];
-                    if !cfg!(feature = "scale") || chunk.copy == 0 {
-                        events_in.records::<7>(chunk, buf, |f| {
+                    let base = payload.len();
+                    // Once the table is ready it stays ready, so a thread's entries from the first
+                    // chunk that saw it on are all resolved.
+                    let ready = persons_cell.get();
+                    if ready.is_some() && *resolved_from == usize::MAX {
+                        *resolved_from = base;
+                    }
+                    match (ready, !cfg!(feature = "scale") || chunk.copy == 0) {
+                        (None, true) => events_in.records::<7>(chunk, buf, |f| {
                             if let Some(rec) = parse_event(&ctx, f) {
                                 push_event(&rec, *thread, payload, events, np);
                             }
-                        });
-                    } else {
-                        events_in.records::<7>(chunk, buf, |f| {
+                        }),
+                        (Some(persons), true) => events_in.records::<7>(chunk, buf, |f| {
+                            if let Some(rec) = parse_event(&ctx, f) {
+                                let n0 = payload.len();
+                                push_event(&rec, *thread, payload, events, np);
+                                if payload.len() > n0 {
+                                    resolve_step(persons, payload, base);
+                                }
+                            }
+                        }),
+                        (ready, false) => events_in.records::<7>(chunk, buf, |f| {
                             if let Some(mut rec) = parse_event(&ctx, f) {
                                 rec.eid = key::salt(rec.eid, chunk.copy);
                                 rec.user = key::salt(rec.user, chunk.copy);
+                                let n0 = payload.len();
                                 push_event(&rec, *thread, payload, events, np);
+                                if let Some(persons) = ready {
+                                    if payload.len() > n0 {
+                                        resolve_step(persons, payload, base);
+                                    }
+                                }
                             }
-                        });
+                        }),
+                    }
+                    if let Some(persons) = ready {
+                        resolve_tail(persons, payload, base);
                     }
                 } else {
                     let chunk = ck_chunks[task - ev_chunks.len()];
@@ -1231,8 +1293,9 @@ fn main() {
             },
         );
         log(start, &format!("parsed {} MB events, {} MB clicks", events_in.bytes() >> 20, clicks_in.bytes() >> 20));
-        (parsed, links.join().expect("links thread panicked"))
+        parsed
     });
+    let persons = persons_cell.into_inner().expect("links thread panicked");
     // The long user and click IDs the parse threads noted go to the dictionary before anything
     // reads names (sessions' click tie-breaks, the output).
     key::publish(threads);
@@ -1240,12 +1303,17 @@ fn main() {
     log(start, "links joined");
     let mut ev_threads = Vec::with_capacity(parsed.len());
     let mut payloads: Vec<Vec<Pay>> = (0..threads).map(|_| Vec::new()).collect();
+    let mut resolved_from: Vec<usize> = vec![0; threads];
     let mut ck_lists = Vec::with_capacity(parsed.len());
     for st in parsed {
         ev_threads.push(st.events.finish());
+        resolved_from[st.thread] = st.resolved_from.min(st.payload.len());
         payloads[st.thread] = st.payload;
         ck_lists.push(st.clicks);
     }
+    let resolved: usize = (0..threads).map(|t| payloads[t].len() - resolved_from[t]).sum();
+    let total_pay: usize = payloads.iter().map(|p| p.len()).sum();
+    log(start, &format!("persons looked up during parse for {resolved} of {total_pay} events"));
     let ev_slots = regroup(ev_threads, np);
     // One bit per payload entry, set when that copy lost its event's dedup.
     let losers: Vec<Vec<AtomicU64>> =
@@ -1315,15 +1383,20 @@ fn main() {
     // ---- map users to persons and bucket by person: kept events (sequential over each
     // thread's payload) and clicks, both cut into small ranges so no task is a straggler
     const RANGE: usize = 32 * 1024;
-    let mut ranges: Vec<(bool, usize, usize, usize)> = Vec::new();
+    // (kind, list, start, end): kind 0 = clicks, 1 = events to look up, 2 = events whose
+    // payload already holds the person (no range straddles a thread's `resolved_from`).
+    let mut ranges: Vec<(u8, usize, usize, usize)> = Vec::new();
     for (li, list) in ck_lists.iter().enumerate() {
         for s in (0..list.len()).step_by(RANGE) {
-            ranges.push((true, li, s, (s + RANGE).min(list.len())));
+            ranges.push((0, li, s, (s + RANGE).min(list.len())));
         }
     }
     for (t, pay) in payloads.iter().enumerate() {
-        for s in (0..pay.len()).step_by(RANGE) {
-            ranges.push((false, t, s, (s + RANGE).min(pay.len())));
+        let cut = resolved_from[t];
+        for (kind, lo, hi) in [(1u8, 0, cut), (2u8, cut, pay.len())] {
+            for s in (lo..hi).step_by(RANGE) {
+                ranges.push((kind, t, s, (s + RANGE).min(hi)));
+            }
         }
     }
     // Person buckets small enough that a bucket's events, clicks and their sorted copies stay
@@ -1342,8 +1415,8 @@ fn main() {
             clicks: scatter::Scatter::new(nq),
         },
         |st, task| {
-            let (is_click, li, s, e) = ranges[task];
-            if is_click {
+            let (kind, li, s, e) = ranges[task];
+            if kind == 0 {
                 let list = &ck_lists[li][s..e];
                 let last = list.len().saturating_sub(1);
                 for i in 0..list.len() {
@@ -1363,6 +1436,16 @@ fn main() {
             }
             let pay = &payloads[li][s..e];
             let lost = &losers[li];
+            if kind == 2 {
+                for (i, p) in pay.iter().enumerate() {
+                    let g = s + i;
+                    if lost[g / 64].load(Ordering::Relaxed) >> (g % 64) & 1 != 0 {
+                        continue;
+                    }
+                    st.sess.push(bucket(p.user, nq), (p.user as u128) << 64 | (p.ts as u128) << 32 | p.pc as u128);
+                }
+                return;
+            }
             let last = pay.len().saturating_sub(1);
             for i in 0..pay.len() {
                 // SAFETY: every index below is at most last < pay.len().
