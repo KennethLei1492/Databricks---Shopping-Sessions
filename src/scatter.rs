@@ -106,7 +106,9 @@ fn give_slab(p: *mut u8) {
 /// A bucket: whole lines in slabs, of which the first `len` records are valid.
 pub struct Lines<T: Copy, const K: usize> {
     slabs: Vec<*mut Line<T, K>>,
-    lines: usize,
+    // Next free line in the last slab, and the end of that slab (both null before the first).
+    cur: *mut Line<T, K>,
+    end: *mut Line<T, K>,
     len: usize,
 }
 
@@ -117,23 +119,25 @@ unsafe impl<T: Copy + Sync, const K: usize> Sync for Lines<T, K> {}
 
 impl<T: Copy, const K: usize> Lines<T, K> {
     fn new() -> Self {
-        Lines { slabs: Vec::new(), lines: 0, len: 0 }
+        Lines { slabs: Vec::new(), cur: std::ptr::null_mut(), end: std::ptr::null_mut(), len: 0 }
     }
 
     /// Appends one line with non-temporal stores, taking a new slab when the last one is full.
     #[inline(always)]
     fn push_line(&mut self, src: *const Line<T, K>) {
-        let i = self.lines % LINES_PER_SLAB;
-        if i == 0 {
-            self.slabs.push(take_slab() as *mut Line<T, K>);
+        if self.cur == self.end {
+            let slab = take_slab() as *mut Line<T, K>;
+            self.slabs.push(slab);
+            self.cur = slab;
+            // SAFETY: a slab holds LINES_PER_SLAB lines.
+            self.end = unsafe { slab.add(LINES_PER_SLAB) };
         }
-        // SAFETY: the last slab has room for LINES_PER_SLAB lines and i < LINES_PER_SLAB; slabs
-        // are 64-byte aligned (4 KB within a 2 MB-aligned region).
+        // SAFETY: cur < end, inside the last slab; slabs are 64-byte aligned (4 KB within a
+        // 2 MB-aligned region).
         unsafe {
-            let dst = self.slabs.last().unwrap().add(i);
-            stream_line(dst as *mut u8, src as *const u8);
+            stream_line(self.cur as *mut u8, src as *const u8);
+            self.cur = self.cur.add(1);
         }
-        self.lines += 1;
     }
 
     /// The records, one slice per slab.
