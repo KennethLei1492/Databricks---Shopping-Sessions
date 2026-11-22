@@ -176,6 +176,33 @@ fn log(start: Instant, what: &str) {
 
 /// Runs `work(state, task)` for tasks 0..n on `threads` threads, pulling tasks dynamically.
 /// Logs the phase's utilization and its longest task, to expose stragglers and barriers.
+#[repr(C)]
+struct Rusage {
+    utime: [i64; 2],
+    stime: [i64; 2],
+    rest: [i64; 2],
+    _idrss_isrss: [i64; 2],
+    minflt: i64,
+    rest2: [i64; 9],
+}
+
+extern "C" {
+    fn getrusage(who: i32, usage: *mut Rusage) -> i32;
+}
+
+/// (user s, kernel s, minor page faults) of the whole process so far.
+fn cpu_now() -> (f64, f64, i64) {
+    // SAFETY: getrusage(RUSAGE_SELF) with a valid out pointer to a struct of its size.
+    unsafe {
+        let mut ru: Rusage = std::mem::zeroed();
+        getrusage(0, &mut ru);
+        (ru.utime[0] as f64 + ru.utime[1] as f64 / 1e6, ru.stime[0] as f64 + ru.stime[1] as f64 / 1e6, ru.minflt)
+    }
+}
+
+static INIT_MAX: AtomicU64 = AtomicU64::new(0);
+static SPAWN_MAX: AtomicU64 = AtomicU64::new(0);
+
 fn parallel<S: Send>(
     name: &str,
     threads: usize,
@@ -184,13 +211,19 @@ fn parallel<S: Send>(
     work: impl Fn(&mut S, usize) + Sync,
 ) -> Vec<S> {
     let next = AtomicUsize::new(0);
+    INIT_MAX.store(0, Ordering::Relaxed);
+    SPAWN_MAX.store(0, Ordering::Relaxed);
+    let cpu0 = cpu_now();
     let t0 = Instant::now();
     let results: Vec<(S, f64, f64, usize, f64)> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|_| {
                 scope.spawn(|| {
+                    let spawned = t0.elapsed().as_secs_f64();
                     let mut state = init();
                     let started = t0.elapsed().as_secs_f64();
+                    INIT_MAX.fetch_max(((started - spawned) * 1e6) as u64, Ordering::Relaxed);
+                    SPAWN_MAX.fetch_max((spawned * 1e6) as u64, Ordering::Relaxed);
                     let (mut busy, mut longest, mut longest_task) = (0f64, 0f64, 0usize);
                     loop {
                         let task = next.fetch_add(1, Ordering::Relaxed);
@@ -216,9 +249,15 @@ fn parallel<S: Send>(
     let busy: f64 = results.iter().map(|r| r.1).sum();
     let (longest, longest_task) = results.iter().map(|r| (r.2, r.3)).fold((0f64, 0), |a, b| if b.0 > a.0 { b } else { a });
     let slowest_start = results.iter().map(|r| r.4).fold(0f64, f64::max);
+    let cpu1 = cpu_now();
     eprintln!(
-        "  phase {name}: {n} tasks, wall {wall:.3}s, utilization {:.0}%, longest task #{longest_task} {longest:.3}s, slowest thread start {slowest_start:.3}s",
-        100.0 * busy / (threads as f64 * wall).max(1e-9)
+        "  phase {name}: {n} tasks, wall {wall:.3}s, utilization {:.0}%, user {:.3}s, kernel {:.3}s, faults {}k, longest task #{longest_task} {longest:.3}s, slowest thread start {slowest_start:.3}s (spawn {:.3}s, init {:.3}s)",
+        100.0 * busy / (threads as f64 * wall).max(1e-9),
+        cpu1.0 - cpu0.0,
+        cpu1.1 - cpu0.1,
+        (cpu1.2 - cpu0.2) / 1000,
+        SPAWN_MAX.load(Ordering::Relaxed) as f64 / 1e6,
+        INIT_MAX.load(Ordering::Relaxed) as f64 / 1e6
     );
     results.into_iter().map(|r| r.0).collect()
 }
@@ -1123,8 +1162,9 @@ fn main() {
                 st.table[slot as usize].eid = key::EMPTY;
             }
             st.used.clear();
-            // The process ends soon: freeing a bucket would only make the allocator purge it.
-            std::mem::forget(owned);
+            // Freed (purging is off, MIMALLOC_PURGE_DELAY=-1): the next phase's buffers reuse
+            // these already-faulted pages instead of new ones the kernel must zero.
+            drop(owned);
         },
     );
     drop(deduped);
@@ -1201,8 +1241,9 @@ fn main() {
             }
         },
     );
-    std::mem::forget(payloads);
-    std::mem::forget(ck_lists);
+    // Freed, not leaked: with purging off, later phases reuse these already-faulted pages.
+    drop(payloads);
+    drop(ck_lists);
     let mut sess_threads = Vec::with_capacity(regrouped.len());
     let mut ck_threads = Vec::with_capacity(regrouped.len());
     for st in regrouped {
